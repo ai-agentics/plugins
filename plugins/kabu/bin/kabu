@@ -1,0 +1,1046 @@
+#!/usr/bin/env python3
+"""kabu: notify a human and ask them, from any script or coding agent (Kabu API v2).
+
+Commands:
+  kabu send [TITLE] MESSAGE     notify; `kabu "message"` with no command does the same
+  kabu ask QUESTION [MESSAGE]   ask and wait for the answer; `kabu --ask "Q?"` does the same
+  kabu status MSG_ID            a message as the API has it (--wait N holds while an ask is pending)
+  kabu whoami                   what the key can do, and the project and agent kabu would send
+  kabu session start|update|end a session and its Live Activity (--headline, --progress N/M)
+  kabu login                    save --api-key KEY, or connect this computer with --device
+  kabu mcp                      Kabu's MCP tools on stdin and stdout, for an agent harness to start
+  kabu guide                    a copy-paste cheat sheet for coding agents (also: kabu help agents)
+  kabu help COMMAND             one command's options and examples (same as kabu COMMAND --help)
+
+Output is one JSON object on stdout. An error is one JSON line on stderr, {"error": {"code", "message", "hint"}};
+the hint is the next step, usually a corrected command. Nothing is ever coloured.
+Exit codes: 0 ok (an ask approved, or a choice or text answered), 2 usage or validation error (nothing was sent),
+3 network or API error, or an answer kabu does not know, 10 rejected, 20 expired, 21 cancelled, 130 interrupted.
+Environment: KABU_API_KEY, KABU_BASE_URL (default https://usekabu.com), KABU_PROJECT, KABU_AGENT, KABU_SOURCE,
+KABU_SESSION, KABU_AUTO_SESSION=1 (one session per host, project and agent), KABU_CONFIG_PATH (default
+~/.config/kabu/config.json, written by kabu login, mode 600).
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import difflib
+import getpass
+import hashlib
+import http.client
+import json
+import mimetypes
+import os
+from pathlib import Path
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Tuple
+
+VERSION = "2.2.0"
+EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
+EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
+DEFAULT_BASE_URL = "https://usekabu.com"
+WAIT = 25  # seconds the API may hold one request for a pending ask (the contract allows 0 to 50)
+GRACE = 120  # seconds kabu keeps waiting past an ask's expiry, for the API to settle it
+RETRIES = 3  # after the first try: network errors, 5xx, 429 with Retry-After, 409 idempotency_key_in_use
+MAX_RETRY_AFTER = 30.0  # a longer Retry-After fails now rather than block the caller
+TITLE_MAX, BODY_MAX = 120, 8192  # MessageCreate maxLength, in characters
+REQUEST_MAX = 64 << 10  # the API's cap on a JSON request, in bytes
+JSON = Dict[str, Any]
+
+
+@dataclass
+class CliError(Exception):
+    """A failure, printed as one JSON line on stderr: {"error": {"code", "message", "hint", ...extra}}."""
+
+    code: str
+    message: str
+    hint: str
+    exit: int = EXIT_USAGE
+    extra: JSON = field(default_factory=dict)
+
+
+def error_line(e: CliError) -> str:
+    """The one JSON line an error prints on stderr. No key ever shows in it: kabu_live_sk_… keeps only its prefix."""
+    line = json.dumps({"error": {"code": e.code, "message": e.message, "hint": e.hint, **e.extra}})
+    return re.sub(r"kabu_(live|test)_sk_\w+", r"kabu_\1_sk_***", line)
+
+
+def emit(obj: JSON, code: int = EXIT_OK, sort: bool = False) -> int:
+    """Print a command's one JSON object, and return its exit code."""
+    print(json.dumps(obj, sort_keys=sort))
+    return code
+
+
+def utf8_json(obj: JSON) -> bytes:
+    """A request body as UTF-8 JSON: \\u escapes cost up to 12 bytes a character against the API's 64 KiB cap."""
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace")  # replace: a lone surrogate from argv
+
+
+def default_config_path() -> Path:
+    if os.environ.get("KABU_CONFIG_PATH"):
+        return Path(os.environ["KABU_CONFIG_PATH"])
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kabu" / "config.json"
+
+
+def load_config() -> JSON:
+    try:
+        data = json.loads(default_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(cfg: JSON) -> Path:
+    """Write the config with mode 600 from the first byte: the key never sits in a readable file."""
+    path = default_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as out:
+        out.write(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
+def resolve_setting(flag: Optional[str], env_keys: Sequence[str], cfg: JSON, cfg_key: str, default: str = "") -> str:
+    """The flag, else the first environment variable set, else the saved setting, else the default."""
+    for candidate in (flag, *(os.environ.get(k) for k in env_keys), cfg.get(cfg_key)):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return default
+
+
+def base_url(flag: Optional[str], cfg: JSON) -> str:
+    url = resolve_setting(flag, ("KABU_BASE_URL", "KABU_API_BASE_URL"), cfg, "base_url", DEFAULT_BASE_URL).rstrip("/")
+    if not re.fullmatch(r"https?://[^/\s]+(/\S*)?", url):
+        raise CliError("invalid_value", f"The base URL {url!r} is not an http:// or https:// URL.", "Fix --base-url, KABU_BASE_URL "
+                       "or the saved one, with: kabu login --base-url https://usekabu.com")
+    return url[:-3] if url.endswith("/v2") else url
+
+
+PROJECT_ENV_KEYS = ("KABU_PROJECT", "AGENT_NOTIFIER_PROJECT")
+
+
+def _git(cwd: Path, *args: str) -> str:
+    try:
+        out = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _read_dotenv_project(path: Path) -> str:
+    """KABU_PROJECT, else AGENT_NOTIFIER_PROJECT, from one .env file (export, quotes and trailing comments allowed)."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    found: Dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        key, sep, val = (line[7:].lstrip() if line.startswith("export ") else line).partition("=")
+        key, val = key.strip(), val.strip()
+        if line.startswith("#") or not sep or key not in PROJECT_ENV_KEYS:
+            continue
+        if val[:1] in ("'", '"'):
+            end = val.find(val[0], 1)
+            val = val[1:end] if end > 0 else val[1:]
+        else:
+            val = val.split(" #", 1)[0].strip()
+        if val:
+            found[key] = val
+    return next((found[k] for k in PROJECT_ENV_KEYS if found.get(k)), "")
+
+
+def _git_roots(cwd: Path) -> Tuple[Optional[Path], Optional[Path]]:
+    """Return (this worktree's top level, the main worktree's top level)."""
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if not top:
+        return None, None
+    common = _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    main = Path(common).parent if common and Path(common).name == ".git" else Path(top)
+    return Path(top).resolve(), main.resolve()
+
+
+def detect_project(cwd: Optional[Path] = None) -> str:
+    """Resolve the project name without a ``--project`` flag; see CONTRACT.md."""
+    cwd = (cwd or Path.cwd()).resolve()
+    for k in PROJECT_ENV_KEYS:
+        if os.environ.get(k, "").strip():
+            return os.environ[k].strip()
+    top, main = _git_roots(cwd)
+    dirs = [cwd]  # from here up to the repository's top, then the main worktree's
+    while top is not None and dirs[-1] != top and dirs[-1].parent != dirs[-1]:
+        dirs.append(dirs[-1].parent)
+    if main is not None and main not in dirs:
+        dirs.append(main)
+    for d in dirs:
+        for name in (".env.local", ".env"):
+            found = _read_dotenv_project(d / name)
+            if found:
+                return found
+    if main is not None:  # the origin remote's repository name, else the main worktree's folder name
+        name = _git(cwd, "config", "--get", "remote.origin.url").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        return (name[:-4] if name.endswith(".git") else name) or main.name
+    saved = load_config().get("project")
+    if isinstance(saved, str) and saved.strip():
+        return saved.strip()
+    return f"{cwd.name or 'default'}@{socket.gethostname().split('.', 1)[0] or 'host'}"
+
+
+# Process names of agent harnesses, looked for among kabu's ancestors.
+AGENT_PROCESSES = {"claude": "claude-code", "copilot": "copilot-cli", "codex": "codex", "cursor-agent": "cursor", "gemini": "gemini-cli",
+                   "opencode": "opencode", "aider": "aider", "goose": "goose", "amp": "amp", "pi": "pi"}
+# Variables harnesses set for the commands they run; never their configuration, such as CODEX_HOME.
+AGENT_VARIABLES = {"CLAUDECODE": "claude-code", "CLAUDE_CODE_ENTRYPOINT": "claude-code", "CURSOR_AGENT": "cursor",
+                   "CURSOR_TRACE_ID": "cursor", "GEMINI_CLI": "gemini-cli", "CODEX_THREAD_ID": "codex", "CODEX_SANDBOX": "codex",
+                   "PI_CODING_AGENT": "pi"}
+
+
+def ancestors() -> List[str]:
+    """The executable names of kabu's ancestor processes, nearest first. Names only: arguments can hold secrets."""
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = re.findall(r"^\s*(\d+)\s+(\d+)\s+(.+)$", listing, re.MULTILINE)
+    parents = {int(pid): (int(ppid), Path(comm).name.lower()) for pid, ppid, comm in rows}
+    names: List[str] = []
+    pid = os.getppid()
+    while pid in parents and len(names) < 32:
+        pid, name = parents[pid]
+        names.append(name)
+    return names
+
+
+def detect_agent(env: Mapping[str, str], names: Sequence[str]) -> str:
+    """The harness running kabu: the nearest ancestor it knows, else AI_AGENT, else a variable a harness set, else kabu-cli."""
+    found = [AGENT_PROCESSES[n] for n in names if n in AGENT_PROCESSES]
+    found.append(re.sub(r"[^a-z0-9]+", "-", env.get("AI_AGENT", "").lower()).strip("-"))
+    found += [agent for var, agent in AGENT_VARIABLES.items() if env.get(var, "").lower() not in ("", "0", "false")]
+    return next((agent for agent in found if agent), "kabu-cli")[:64]
+
+
+def resolve_agent(flag: Optional[str] = None) -> str:
+    """--agent, KABU_AGENT (or AGENT_NOTIFIER_AGENT), the agent saved by kabu login, then the harness detected."""
+    return resolve_setting(flag, ("KABU_AGENT", "AGENT_NOTIFIER_AGENT"), load_config(), "agent") or detect_agent(os.environ, ancestors())
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an HTTP error, never followed: urllib would send the bearer key on to wherever it points."""
+
+    def redirect_request(self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+OPEN = urllib.request.build_opener(NoRedirect).open
+
+
+@dataclass
+class Api:
+    """Kabu API v2 over urllib: JSON in and out, bounded retries; an API problem becomes a CliError (exit 3)."""
+
+    base: str
+    key: str = ""
+    timeout: float = 30.0
+    retries: int = RETRIES
+
+    @classmethod
+    def connect(cls, a: JSON) -> Api:
+        """The client for --api-key and --base-url, else the environment, else the saved login."""
+        cfg = load_config()
+        key = resolve_setting(a.get("api_key"), ("KABU_API_KEY", "AGENT_NOTIFIER_API_KEY"), cfg, "api_key").strip()
+        if not key:
+            raise CliError("missing_api_key", "No Kabu API key.", "Set KABU_API_KEY=kabu_live_sk_…, or run: kabu login --api-key KEY")
+        if not re.fullmatch(r"[\x21-\x7e]+", key):  # printable ASCII only: a header error would print the key whole
+            raise CliError("invalid_api_key", "The API key (--api-key, KABU_API_KEY or the saved one) has a space, line break or "
+                           "other character no key has.", "Save it again with: kabu login --api-key - < key.txt")
+        return cls(base_url(a.get("base_url"), cfg), key, a.get("timeout") or 30.0)
+
+    def call(self, method: str, path: str, body: Optional[JSON] = None, *, wait: int = 0, idem: str = "",
+             form: Optional[Dict[str, str]] = None) -> JSON:
+        """One API call; `idem` is the Idempotency-Key that makes a retried create return the first result."""
+        headers = {"Accept": "application/json", "User-Agent": f"kabu-cli/{VERSION}",
+                   **({"Authorization": f"Bearer {self.key}"} if self.key else {}), **({"Idempotency-Key": idem} if idem else {})}
+        data = None
+        if body is not None:
+            data, headers["Content-Type"] = utf8_json(body), "application/json"
+        if form is not None:
+            data, headers["Content-Type"] = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+        raw = self.request(method, self.base + path + (f"?wait={wait}" if wait else ""), data, headers, self.timeout + wait)
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            raise CliError("bad_response", f"{method} {path} did not return JSON.",
+                           "Check that KABU_BASE_URL points at the Kabu API.", EXIT_TRANSPORT) from None
+        return parsed if isinstance(parsed, dict) else {"data": parsed}
+
+    def request(self, method: str, url: str, data: Optional[bytes], headers: Dict[str, str], timeout: float) -> bytes:
+        """Send, and retry with the same headers, so the same Idempotency-Key, up to self.retries times."""
+        attempt = 0
+        while True:
+            try:
+                with OPEN(urllib.request.Request(url, data, headers, method=method), timeout=timeout) as resp:
+                    return bytes(resp.read())
+            except urllib.error.HTTPError as exc:
+                error, delay = self.problem(exc, method, url, attempt)
+            except (OSError, http.client.HTTPException) as exc:  # refused, reset, timed out
+                error = CliError("network_error", f"{method} {url} failed: {getattr(exc, 'reason', exc)}.",
+                                 "Check the network and KABU_BASE_URL, then run the same command again.", EXIT_TRANSPORT)
+                delay = 0.5 * 2 ** attempt
+            if delay is None or attempt == self.retries:
+                raise error
+            time.sleep(delay)
+            attempt += 1
+
+    @staticmethod
+    def problem(exc: urllib.error.HTTPError, method: str, url: str, attempt: int) -> Tuple[CliError, Optional[float]]:
+        """The API's problem (RFC 9457, or an OAuth error) as a CliError, and the seconds to wait before a retry (None: none)."""
+        try:
+            problem = json.loads(exc.read() or b"{}")
+        except (ValueError, OSError):
+            problem = {}
+        problem = problem if isinstance(problem, dict) else {}
+        status, after = exc.code, exc.headers.get("Retry-After") or ""
+        code = str(problem.get("code") or problem.get("error") or f"http_{status}")
+        message = problem.get("detail") or problem.get("error_description") or problem.get("title") or f"{method} {url}: HTTP {status}."
+        fallback = "Run the same command again shortly." if status >= 500 else "Check the request, and the key and base URL (kabu whoami)."
+        extra = {"status": status, **{k: problem[k] for k in ("param", "request_id") if problem.get(k)}}
+        error = CliError(code, str(message), str(problem.get("hint") or fallback), EXIT_TRANSPORT, extra)
+        if status < 500 and code != "idempotency_key_in_use" and not (status == 429 and after):
+            return error, None  # quota_exceeded is a 429 without Retry-After: it lasts until the plan resets
+        delay = float(after) if re.fullmatch(r"\d+(\.\d+)?", after) else 0.5 * 2 ** attempt
+        return error, (delay if delay <= MAX_RETRY_AFTER else None)
+
+    def upload(self, path: Path, idem: str) -> str:
+        """Upload one file (POST /v2/media/uploads, then PUT the bytes) and return its med_ id."""
+        raw = path.read_bytes()
+        ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        up = self.call("POST", "/v2/media/uploads", {"filename": path.name, "content_type": ctype, "size": len(raw),
+                                                      "sha256": hashlib.sha256(raw).hexdigest()}, idem=idem)
+        media, url = up.get("media") or {}, up.get("upload_url")
+        if not isinstance(url, str) or not isinstance(media.get("id"), str):
+            raise CliError("bad_response", f"The upload of {path.name} returned no upload_url or media id.",
+                           "Run the same command again.", EXIT_TRANSPORT)
+        if media.get("status") != "ready":  # a replayed key may find the bytes already in place
+            headers = {"Content-Type": ctype, **{k: v for k, v in (up.get("headers") or {}).items() if isinstance(v, str)}}
+            self.request("PUT", self.base + url if url.startswith("/") else url, raw, headers, self.timeout)
+        return str(media["id"])
+
+
+def field_pair(cmd: str, item: str) -> JSON:
+    """--field KEY=VALUE as the contract's {label, value}."""
+    key, sep, val = (s.strip() for s in item.partition("="))
+    if not sep or not 0 < len(key) <= 40 or len(val) > 200:
+        raise CliError("invalid_value", f"--field {item!r} is not KEY=VALUE with a key of 1 to 40 characters and a value of up to 200.",
+                       f"Example: kabu {SAMPLES[cmd]} --field env=prod")
+    return {"label": key, "value": val}
+
+
+def link(cmd: str, item: str) -> JSON:
+    """--link LABEL=URL, or a bare URL; a bare URL's label is filled in from --url-title, else Open."""
+    name, sep, url = item.partition("=")
+    bare = not sep or "://" in name
+    name, url = ("", item) if bare else (name.strip(), url)
+    if not (bare or 0 < len(name) <= 40) or len(url) > 2048 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:\S+", url):
+        raise CliError("invalid_value", f"--link {item!r} is not LABEL=URL with a label of 1 to 40 characters and an "
+                       "absolute URL of up to 2048.", f'Example: kabu {SAMPLES[cmd]} --link "PR=https://github.com/o/r/pull/7"')
+    return {"label": name, "url": url}
+
+
+def json_object(cmd: str, raw: str) -> JSON:
+    """--args: one JSON object, finite numbers only, up to the contract's 16 KiB."""
+    hint = f"""Example: kabu {SAMPLES[cmd]} --action db.migrate --args '{{"version": 42}}'"""
+    try:
+        args = json.loads(raw)
+        size = len(json.dumps(args, allow_nan=False, ensure_ascii=False, separators=(",", ":")).encode())
+    except ValueError as exc:
+        raise CliError("invalid_value", f"--args is not valid JSON: {exc}.", hint) from None
+    if not isinstance(args, dict) or size > 16 << 10:
+        raise CliError("invalid_value", "--args must be one JSON object of up to 16 KiB.", hint)
+    return args
+
+
+def attachment(cmd: str, raw: str) -> Path:
+    path = Path(os.path.expanduser(raw))  # unlike Path.expanduser, never raises for ~nosuchuser
+    size = path.stat().st_size if path.is_file() and os.access(path, os.R_OK) else -1
+    if size < 0:
+        raise CliError("file_not_found", f"--file {raw}: no such file, or kabu cannot read it.",
+                       f"Check the path. Example: kabu {SAMPLES[cmd]} --file ./a.png")
+    if not 0 < size <= 2 ** 31:
+        raise CliError("invalid_file", f"--file {raw} is {size} bytes; an attachment takes 1 byte to 2 GiB.",
+                       "Attach a non-empty file under 2 GiB.")
+    return path
+
+
+@dataclass(frozen=True)
+class Opt:
+    """One option: how it parses, what it accepts, its default and where it lands in the request body."""
+
+    flags: Tuple[str, ...]  # the first long flag names the value
+    help: str
+    example: str = ""  # a valid value, for help and error hints
+    path: str = ""  # request body field, "a.b" to nest; empty when code builds it
+    kind: str = "text"  # text, int, float, flag or list
+    limit: int = 0  # most characters (text) or uses (list)
+    bounds: Tuple[float, float] = (0, 0)  # range of an int or float
+    choices: Tuple[str, ...] = ()
+    pattern: str = ""  # a regex the whole value must match
+    needs: str = ""  # an option this one requires
+    ask: bool = False  # only on an ask
+    metavar: Optional[str] = None
+    default: Optional[Callable[[], Any]] = None  # the value when the option is not given
+    convert: Optional[Callable[[str, str], Any]] = None  # (command, checked value) to what the request carries
+
+    @property
+    def dest(self) -> str:
+        return self.flags[0].lstrip("-").replace("-", "_")
+
+
+PRIORITY_NUMBERS = {"-1": "low", "0": "normal", "1": "high", "2": "high"}  # kabu.py's; agent keys cannot send urgent
+ACCENTS = ("neutral", "blue", "green", "amber", "red", "purple", "teal", "pink", "orange", "indigo", "mint", "brown", "slate")
+CONNECTION = (
+    Opt(("--api-key",), "API key (default: KABU_API_KEY, then the saved login)", "kabu_live_sk_…"),
+    Opt(("--base-url",), "API base URL (default: KABU_BASE_URL, the saved login, https://usekabu.com)", "https://usekabu.com"),
+    Opt(("--timeout",), "seconds to wait for each response, 1 to 600 (default 30)", "30", kind="float", bounds=(1, 600), metavar="SECONDS"),
+    Opt(("--json",), "ignored: kabu always prints one JSON object (kabu.py's flag)", kind="flag"),
+)
+PROJECT = Opt(("--project", "-p"), "project, max 64 (default: KABU_PROJECT, .env, the repo name)", "payments-api", path="project", limit=64,
+              default=detect_project)
+AGENT = Opt(("--agent", "-a"), "agent, max 64 (default: KABU_AGENT, the login's, the harness)", "claude-code", path="agent", limit=64,
+            default=resolve_agent)
+MESSAGE = (
+    Opt(("--title", "-t"), "title, max 120 characters (default: the message's first line)", "Build passed"),
+    Opt(("--message", "-m", "--body"), "message, Markdown, max 8192 characters; - reads stdin", "All 412 tests passed"),
+    Opt(("--ask",), "the question (kabu.py's form: kabu --ask Q is kabu ask Q)", "Deploy to prod?", ask=True, metavar="QUESTION"),
+    Opt(("--ask-text",), "a question answered by typing: --ask Q --type text", "Release name?", ask=True, metavar="QUESTION"),
+    PROJECT, AGENT,
+    Opt(("--source", "-s"), "machine label, max 120 (default: KABU_SOURCE, the hostname)", "ci-runner-3", path="source", limit=120,
+        default=lambda: resolve_setting(None, ("KABU_SOURCE",), load_config(), "source", socket.gethostname()[:120])),
+    Opt(("--session",), "a ses_… session to show it in (default: KABU_SESSION)", "ses_01J9Z", path="session", pattern=r"ses_\S+",
+        default=lambda: os.environ.get("KABU_SESSION")),
+    Opt(("--priority",), "low, normal, high or urgent; or -1, 0, 1, 2", "high", path="priority",
+        choices=("low", "normal", "high", "urgent", *PRIORITY_NUMBERS), convert=lambda cmd, v: PRIORITY_NUMBERS.get(v, v)),
+    Opt(("--expires-in", "--ask-timeout"), "seconds until it expires, 60 to 2592000 (an ask: 300)", "900", path="expires_in",
+        kind="int", bounds=(60, 2592000), metavar="SECONDS"),
+    Opt(("--sensitive",), "hide the content on lock screens and previews", path="sensitive", kind="flag"),
+    Opt(("--collapse-key",), "a later notify with this key replaces it, max 64", "nightly", path="collapse_key", limit=64, metavar="KEY"),
+    Opt(("--accent",), "colour: " + ", ".join(ACCENTS), "teal", path="appearance.accent", choices=ACCENTS),
+    Opt(("--icon",), "this message's icon, max 64: an SF Symbol name, which the app draws (lowercase words and dots), or a med_… id",
+        "checkmark.seal.fill", path="appearance.icon", limit=64, pattern=r"med_\S+|[a-z0-9]+(\.[a-z0-9]+)*"),
+    Opt(("--field",), "a key fact, up to 12 (key max 40, value max 200)", "env=prod", path="fields", kind="list", limit=12,
+        metavar="KEY=VALUE", convert=field_pair),
+    Opt(("--link", "--url"), "a link, up to 4: LABEL=URL, or a bare URL labelled by --url-title (default Open)",
+        "PR=https://github.com/o/r/pull/7", path="links", kind="list", limit=4, metavar="LABEL=URL", convert=link),
+    Opt(("--url-title",), "the label of links given without one, max 40", "Open PR", needs="link", limit=40, metavar="LABEL"),
+    Opt(("--code",), "a code block, max 8000 characters; - reads stdin", "print('hi')", limit=8000),
+    Opt(("--language",), "the code block's language, max 30", "python", needs="code", limit=30),
+    Opt(("--diff",), "a diff block, max 16000 characters; - reads stdin", "-", limit=16000),
+    Opt(("--diff-path",), "the diff's file name, max 300 (a label: nothing is read)", "src/app.py", needs="diff", limit=300, metavar="PATH"),
+    Opt(("--quote",), "a quote block, max 2000 characters; - reads stdin", "Ship it", limit=2000),
+    Opt(("--action",), "the action to approve, max 100", "db.migrate", path="action.name", limit=100),
+    Opt(("--args",), "the action's arguments: a JSON object, max 16 KiB", '{"version": 42}', path="action.args", needs="action",
+        metavar="JSON", convert=json_object),
+    Opt(("--action-description",), "what it does, max 2000", "Adds an index", path="action.description", needs="action", limit=2000),
+    Opt(("--as-audio",), "also speak it (generated from the message)", path="voice.speak", kind="flag"),
+    Opt(("--voice", "--tts-voice"), "the voice to speak with, max 60 (implies --as-audio)", "alloy", path="voice.voice", limit=60),
+    Opt(("--speed", "--tts-speed"), "speech speed, 0.5 to 2.0 (implies --as-audio)", "1.25", path="voice.speed", kind="float", bounds=(0.5, 2)),
+    Opt(("--file", "--file-path", "--attach", "--attachment", "--image"), "attach a file, up to 10 (a spoken notify: 9)", "report.png",
+        kind="list", limit=10, metavar="PATH", convert=attachment),
+    Opt(("--type",), "confirm (approve or reject), choice, multi or text (default: choice with -c, else confirm)", "choice",
+        choices=("confirm", "choice", "multi", "text"), ask=True),
+    Opt(("--choice", "-c", "--option"), "an option, 2 to 12, label max 40; ID:LABEL sets its id", "staging", kind="list", limit=12, ask=True),
+    Opt(("--allow-reply", "--allow-free-form"), "the human may type a reply instead", path="ask.allow_reply", kind="flag", ask=True),
+    Opt(("--irreversible",), "the human must unlock their device; never decided on expiry", path="ask.irreversible", kind="flag", ask=True),
+    Opt(("--no-wait",), "do not wait: print the id, then poll with kabu status ID --wait 50", kind="flag", ask=True),
+    Opt(("--dry-run",), "the API validates it and shows the push and Live Activity text; nothing is sent", kind="flag"),
+) + CONNECTION
+STATUS = (Opt(("--wait",), "hold up to N seconds, 0 to 50, while an ask is pending", "50", kind="int", bounds=(0, 50)),) + CONNECTION
+SESSION_UPDATE = (
+    Opt(("--headline",), "the Live Activity's line, max 80", "Running tests", path="headline", limit=80),
+    Opt(("--progress",), "how far along: N/M, such as 3/8", "3/8", path="progress", pattern=r"\d+(\.\d+)?/(?!0+(\.0*)?$)\d+(\.\d+)?",
+        metavar="N/M", convert=lambda cmd, v: {"value": float(v.split("/")[0]), "total": float(v.split("/")[1])}),
+    Opt(("--progress-label",), "what the progress counts, max 60", "tests", path="progress.label", needs="progress", limit=60, metavar="TEXT"),
+)
+SESSION_CREATE = (
+    Opt(("--title",), "what the session is for, max 80 (required)", "Fix flaky auth test", path="title", limit=80),
+    PROJECT, AGENT,
+    Opt(("--external-id",), "your run id, max 120: start gets or creates the session of project, agent and id", "run-77",
+        path="external_id", limit=120, metavar="ID"),
+)
+SESSION_END = (
+    Opt(("--outcome",), "success, failure or cancelled", "success", path="outcome", choices=("success", "failure", "cancelled")),
+    Opt(("--summary",), "how it went, max 500", "PR opened", path="summary", limit=500),
+    Opt(("--dismiss-after",), "seconds the ended Live Activity stays, 0 to 14400", "600", path="dismiss_after", kind="int", bounds=(0, 14400)),
+) + CONNECTION
+KEY = Opt(("--api-key",), "the key to save (kabu_live_sk_… or kabu_test_sk_…); - reads it from stdin", "kabu_live_sk_…",
+          pattern=r"kabu_[A-Za-z0-9_]+")
+LOGIN = (
+    KEY,
+    Opt(("--device",), "connect this computer: approve a code in Kabu, and its own key is saved", kind="flag"),
+    Opt(("--name",), "the computer's name shown when approving, max 80 (default: the hostname)", "work-laptop", limit=80,
+        default=lambda: socket.gethostname().split(".")[0][:80]),
+    Opt(("--base-url",), "API base URL to save (default: KABU_BASE_URL, the saved one, https://usekabu.com)", "https://usekabu.com"),
+    Opt(("--project", "-p"), "default project to save, max 64", "payments-api", limit=64),
+    Opt(("--agent", "-a"), "default agent to save, max 64", "claude-code", limit=64),
+)
+ENV_HELP = "\n\nEnvironment: KABU_API_KEY, KABU_BASE_URL, KABU_PROJECT, KABU_AGENT, KABU_SESSION and more: kabu --help."
+SESSION_ID = ("id", "?", "a ses_… id (default: KABU_SESSION)")
+TEXT_ARG = ("text", "*", "MESSAGE, or TITLE MESSAGE; - reads the message from stdin")
+SAMPLES = {"send": 'send "Build passed"', "ask": 'ask "Deploy to prod?"'}
+NAMES = ("send", "ask", "status", "whoami", "session", "login", "mcp", "guide", "help")
+LEGACY = ("daemon", "listen", "service", "steer", "identity", "project")  # kabu.py's commands that kabu does not have
+YES_NO = {("yes", "no"), ("y", "n"), ("approve", "reject")}  # the -c pairs that make a bare --ask kabu.py's yes or no
+RENAMED = {"--check-status": "Use: kabu status MSG_ID", "--progress": "Use: kabu session update --progress 3/8",
+           "--quiet": "Drop the JSON: kabu send … > /dev/null", "-q": "Drop the JSON: kabu send … > /dev/null",
+           "--id-only": "Read the id: kabu send … | jq -r .id", "--fyi": "An FYI is a notify: kabu send TITLE MESSAGE",
+           "--category": "Use --field category=VALUE.", "--metadata": "Use --field KEY=VALUE, a fact the human sees.",
+           "--max-retries": "kabu retries 3 times by itself.", "--client-event-id": "kabu sends an Idempotency-Key by itself."}
+GUIDE = """\nFor coding agents:
+- One argument is the message, two are TITLE MESSAGE; quote multi-word text; - reads stdin.
+- Limits: title 120, message 8192, --field 12 (key 40, value 200), --link 4, --file 10, -c 2 to 12 (label 40).
+- Check first: --dry-run has the API validate it and sends nothing; kabu whoami shows the key, project and agent.
+- Yes or no: kabu ask "Deploy?" exits 0 only when approved (10 rejected); --type confirm -c Ship -c Wait names the buttons.
+- With -c it is a choice, which exits 0 whatever is chosen: branch on .option, never on the exit code.
+- If a tool call may time out before a human answers: kabu ask … --no-wait, then kabu status ID --wait 50.
+  kabu status exits 0 whatever the answer: read .status and .resolution.decision.
+- An error that names an ask's id means the ask is still open: wait with kabu status ID --wait 50, never ask again.
+- Project and agent are detected (KABU_PROJECT and KABU_AGENT override); KABU_SESSION puts messages in a session.
+- kabu.py's calls work too: kabu --title T "message" --file-path X; kabu --ask Q -c Yes -c No is yes or no (No exits 10)."""
+
+
+def example(cmd: str, *opts: Opt) -> str:
+    """A corrected command line for an error hint."""
+    uses = [o.flags[0] + (f" {shlex.quote(o.example)}" if o.example else "") for o in opts]
+    return " ".join(["Example: kabu", SAMPLES.get(cmd, cmd), *uses])
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that raises a CliError instead of printing usage and exiting."""
+
+    color: bool  # Python 3.14+ colours help on a terminal; kabu never colours
+
+    def error(self, message: str) -> NoReturn:
+        raise CliError("usage", f"{self.prog}: {message}.", f"Run: {self.prog} --help")
+
+
+def parse(cmd: str, args: Sequence[str]) -> JSON:
+    """Parse one command's arguments; an unknown flag fails with the closest real one."""
+    spec = COMMANDS[cmd]
+    p = Parser(prog=f"kabu {cmd}", description=spec.about, epilog="examples:\n" + spec.examples + ENV_HELP, allow_abbrev=False,
+               formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.color = False
+    if spec.positional:
+        name, nargs, help_ = spec.positional
+        p.add_argument(name, nargs=nargs, help=help_, metavar=name.upper())
+    for o in spec.opts:
+        kw: JSON = {"action": "store_true"} if o.kind == "flag" else {"metavar": o.metavar}
+        if o.kind == "list":
+            kw.update(action="append", default=[])
+        p.add_argument(*o.flags, dest=o.dest, help=argparse.SUPPRESS if o.ask and cmd == "send" else o.help, **kw)
+    ns, extra = p.parse_known_intermixed_args(list(args))
+    if extra:
+        flag = extra[0].split("=", 1)[0]
+        if not flag.startswith("-"):
+            shown = "" if cmd == "login" else f" {extra[0]!r}"  # never echo what may be a key
+            raise CliError("unexpected_argument", f"Unexpected argument{shown}.", f"Run: kabu {cmd} --help")
+        by_flag = {f: o for o in spec.opts for f in o.flags}
+        close = [] if flag in RENAMED else difflib.get_close_matches(flag, by_flag, n=1, cutoff=0.8)
+        raise CliError("unknown_flag", f"kabu {cmd} has no {flag} flag." + (f" Did you mean {close[0]}?" if close else ""),
+                       RENAMED.get(flag) or (example(cmd, by_flag[close[0]]) if close else f"Run: kabu {cmd} --help"))
+    return vars(ns)
+
+
+def given(value: Any) -> bool:
+    return value is not None and value is not False and value != []
+
+
+def check(cmd: str, opts: Sequence[Opt], a: JSON, asking: bool = False) -> JSON:
+    """Fill in each row's default and check every option given against its row, before any HTTP call. Converts the values
+    in place, and returns the request body fields the rows name (a.b nests)."""
+    by_dest = {o.dest: o for o in opts}
+    body: JSON = {}
+    for o in opts:
+        if o.default and not given(a.get(o.dest)):
+            a[o.dest] = o.default()
+        if not given(a.get(o.dest)):
+            continue
+        if o.ask and not asking:
+            raise CliError("ask_only", f"{o.flags[0]} only applies to an ask.", example("ask", o))
+        if o.needs and not given(a.get(o.needs)):
+            raise CliError("missing_flag", f"{o.flags[0]} needs {by_dest[o.needs].flags[0]}.", example(cmd, by_dest[o.needs], o))
+        a[o.dest] = value(cmd, o, a[o.dest])
+        if o.path:
+            parent, _, key = o.path.rpartition(".")
+            node = body.setdefault(parent, {}) if parent else body
+            node[key] = a[o.dest]
+    return body
+
+
+def value(cmd: str, o: Opt, raw: Any) -> Any:
+    """One option's value, checked against its limit, range, choices or pattern, then converted."""
+    flag = o.flags[0]
+    if o.kind == "flag":
+        return True
+    if o.kind == "list":
+        if o.limit and len(raw) > o.limit:
+            raise CliError("too_many", f"{flag} is given {len(raw)} times; the limit is {o.limit}.", example(cmd, o))
+        return [o.convert(cmd, item) for item in raw] if o.convert else raw
+    text = str(raw)
+    if o.kind in ("int", "float"):
+        lo, hi = o.bounds
+        number = float(text) if re.fullmatch(r"\d+" if o.kind == "int" else r"\d+(\.\d+)?", text) else float("nan")
+        if not lo <= number <= hi:
+            kind = "a whole number" if o.kind == "int" else "a number"
+            raise CliError("invalid_value", f"{flag} must be {kind} from {lo} to {hi}, not {text!r}.", example(cmd, o))
+        return int(number) if o.kind == "int" else number
+    if o.choices and text not in o.choices:
+        close = difflib.get_close_matches(text, o.choices, n=1)
+        raise CliError("invalid_value", f"{flag} {text!r} is not one of {', '.join(o.choices)}."
+                       + (f" Did you mean {close[0]!r}?" if close else ""), example(cmd, o))
+    if o.limit and len(text) > o.limit:
+        raise CliError("too_long", f"{flag} is {len(text)} characters; the limit is {o.limit}.", example(cmd, o))
+    if o.pattern and not re.fullmatch(o.pattern, text):
+        shown = "" if flag == "--api-key" else f" {text!r}"  # never echo a key
+        raise CliError("invalid_value", f"{flag}{shown} is not valid; it looks like {o.example}.", example(cmd, o))
+    return o.convert(cmd, text) if o.convert else text
+
+
+def texts(cmd: str, a: JSON) -> Tuple[str, str]:
+    """The title (default: the message's first line) and the body. One argument is the message, two are TITLE MESSAGE,
+    and a value of - is read from stdin, for one value at most."""
+    named = [k for k in ("title", "ask", "ask_text") if a[k] is not None]
+    if len(named) > 1:
+        raise CliError("conflicting_flags", "--title, --ask and --ask-text all set the title: give one.", f'{example("ask")} "Canary is green"')
+    a["title"] = a[named[0]] if named else None
+    words, free = a["text"], [k for k in ("title", "message") if a[k] is None]
+    if len(words) > len(free):
+        raise CliError("unexpected_argument", f"Too many arguments: {' '.join(map(repr, words))}.",
+                       f'One argument is the message, two are TITLE MESSAGE; quote multi-word text. {example(cmd)} "412 passed"')
+    a.update(zip(free[-len(words):], words))
+    dashes = [k for k in ("message", "code", "diff", "quote") if a[k] == "-"]
+    if len(dashes) > 1:
+        raise CliError("conflicting_flags", f"Only one value can read stdin (-), not {len(dashes)}: {', '.join(dashes)}.",
+                       f"Pass the others as text. Example: git diff | kabu {SAMPLES[cmd]} --diff - --quote 'Looks good'")
+    if dashes:
+        a[dashes[0]] = sys.stdin.buffer.read().decode("utf-8", "replace")
+    message = (a["message"] or "").strip()
+    title = (a["title"] or "").strip() or message.split("\n", 1)[0][:TITLE_MAX].strip()
+    if not title:
+        raise CliError("missing_text", "Nothing to send: give a message.", example(cmd))
+    if len(title) > TITLE_MAX:
+        raise CliError("too_long", f"The title is {len(title)} characters; the limit is {TITLE_MAX}.",
+                       f'Put the detail in the message. Example: kabu {cmd} "Deploy to prod?" "Canary is green"')
+    if len(message) > BODY_MAX:
+        raise CliError("too_long", f"The message is {len(message)} characters; the limit is {BODY_MAX}.",
+                       f'Shorten it, or attach the whole text. Example: kabu {cmd} "Nightly report" "Summary" --file report.md')
+    return title, message or title
+
+
+def option(index: int, choice: str) -> Dict[str, str]:
+    """-c LABEL, or -c ID:LABEL when ID is an id (a letter, then letters, digits, _ . or -) and no space follows the colon,
+    so 10:00 and "Retry: once" stay whole labels. The id defaults to the label in lower case, with _ for anything else."""
+    split = re.fullmatch(r"([A-Za-z][A-Za-z0-9_.-]{0,63}):(\S.*)", choice.strip())
+    label = (split.group(2) if split else choice).strip()
+    oid = split.group(1) if split else "".join(ch if ch.isascii() and ch.isalnum() else "_" for ch in label.lower()).strip("_")[:64]
+    if not 0 < len(label) <= 40:
+        raise CliError("invalid_value", f"-c {choice!r} needs a label of 1 to 40 characters.",
+                       'Example: kabu ask "Which env?" -c staging -c "prod:Production (EU)"')
+    return {"id": oid or f"opt_{index}", "label": label}
+
+
+def ask_body(a: JSON) -> JSON:
+    """The ask: confirm by default, choice with -c, or the --type given."""
+    choices: List[str] = a["choice"]
+    kind = a["type"] or ("text" if a["ask_text"] else "choice" if choices else "confirm")
+    if kind == "text" or a["ask_text"]:
+        if choices or kind != "text":
+            raise CliError("conflicting_flags", "A text ask takes no -c and no other --type.", 'Example: kabu ask "Release name?" --type text')
+        return {"type": kind}
+    if kind == "confirm":
+        if choices and (len(choices) != 2 or any(not 0 < len(c) <= 40 for c in choices)):
+            raise CliError("invalid_value", "A confirm ask takes no -c, or two labels of up to 40 characters: approve, then reject.",
+                           'Example: kabu ask "Ship it?" --type confirm -c Ship -c Wait')
+        options = [{"id": d, "label": c, "decision": d} for d, c in zip(("approve", "reject"), choices)]
+        return {"type": kind, **({"options": options} if options else {})}
+    if len(choices) < 2:
+        raise CliError("too_few", f"A {kind} ask needs 2 to 12 -c options, not {len(choices)}.",
+                       'Example: kabu ask "Which env?" -c staging -c prod')
+    options = [option(i, c) for i, c in enumerate(choices, 1)]
+    if len({o["id"] for o in options}) < len(options):
+        raise CliError("invalid_value", "Two -c options have the same id.", "Give each its own id: -c stg:Staging -c prd:Production")
+    return {"type": kind, "options": options, **({"min": 1, "max": len(options)} if kind == "multi" else {})}
+
+
+def build_message(cmd: str, a: JSON) -> Tuple[JSON, List[Path]]:
+    """The validated request body and files for send or ask. No HTTP call."""
+    if a["project"] in PRIORITY_NUMBERS:  # kabu.py's -p was its priority
+        raise CliError("invalid_value", f"--project {a['project']!r} looks like kabu.py's -p priority; in kabu, -p is --project.",
+                       f"Example: kabu {SAMPLES[cmd]} --priority {PRIORITY_NUMBERS[a['project']]}")
+    asking = cmd == "ask"
+    title, message = texts(cmd, a)
+    body: JSON = {"title": title, "body": message, **check(cmd, MESSAGE, a, asking)}
+    for each in body.get("links", []):
+        each["label"] = each["label"] or a["url_title"] or "Open"
+    for kind, extra, key in (("code", "language", "language"), ("diff", "diff_path", "path"), ("quote", "", "")):
+        if given(a[kind]):
+            body.setdefault("blocks", []).append({"type": kind, "text": a[kind], **({key: a[extra]} if extra and a[extra] else {})})
+    if "voice" in body:
+        body["voice"]["speak"] = True  # --voice and --speed imply --as-audio
+        if not asking and len(a["file"]) > 9:
+            raise CliError("too_many", "A spoken notify takes 9 files: speech fills the tenth attachment.", "Attach up to 9 files.")
+    if asking:
+        body["ask"] = {**ask_body(a), **body.get("ask", {})}
+        body.setdefault("expires_in", 300)
+    size = len(utf8_json(body)) + 64 * (len(a["file"]) + 1)  # and room for the media and session ids added later
+    if size > REQUEST_MAX:
+        raise CliError("too_large", f"The request comes to {size} bytes; the API takes up to {REQUEST_MAX} (64 KiB of UTF-8 JSON).",
+                       f'Shorten the text, or attach it. Example: kabu {cmd} "Nightly report" "Summary" --file report.md')
+    return body, a["file"]
+
+
+def the_id(cmd: str, raw: Optional[str], prefix: str, env: str = "") -> str:
+    """A msg_ or ses_ id from the argument, else the environment variable: checked before any HTTP call, quoted for a URL."""
+    got = raw or (os.environ.get(env) if env else None) or ""
+    if not re.fullmatch(prefix + r"\S+", got):
+        raise CliError("invalid_id", f"kabu {cmd} needs a {prefix}… id" + (f" (or {env})" if env else "")
+                       + (f", not {got!r}." if got else "."), f"Example: kabu {cmd} {prefix}01J9Z")
+    return urllib.parse.quote(got, safe="")
+
+
+def classify_ask_outcome(msg: JSON, kind: str) -> Tuple[JSON, int]:
+    """The printed answer of an ask, and its exit code: 0 only for an explicit approve, or the answer to a choice, multi
+    or text ask; 10 for a reject, or a typed reply to a confirm (kind); 3 for any other decision, or none."""
+    status, resolution = str(msg.get("status") or "unknown"), msg.get("resolution")
+    r: JSON = resolution if isinstance(resolution, dict) else {}
+    decision = "reject" if r.get("decision") == "deny" else r.get("decision")  # deny: the legacy name; never inferred
+    seen = {"id": msg.get("id"), "outcome": status, "status": status, "decision": decision}
+    if status in ("expired", "cancelled"):
+        return seen, EXIT_EXPIRED if status == "expired" else EXIT_CANCELLED
+    option, options = r.get("option"), r.get("options")
+    choices = [str(x) for x in options] if isinstance(options, list) else [option] if isinstance(option, str) and option else None
+    answer = {**seen, "option": option, "choices": choices, "text": r.get("text"), "values": r.get("values"), "via": r.get("via")}
+    if status == "answered" and (decision == "approve" or decision == "respond" and kind != "confirm"):
+        return answer, EXIT_OK
+    return answer, EXIT_REJECTED if status == "answered" and decision in ("reject", "respond") else EXIT_TRANSPORT
+
+
+def cmd_message(cmd: str, a: JSON) -> int:
+    """send or ask: upload the files, create the message and, for an ask, wait until it settles."""
+    body, files = build_message(cmd, a)
+    api = Api.connect(a)
+    if a["dry_run"]:  # the API validates it and renders each surface; nothing is uploaded or sent
+        return emit({"ok": True, "dry_run": True, "request": body, "files": [str(f) for f in files],
+                     "preview": api.call("POST", "/v2/messages/preview", body)})
+    key = str(uuid.uuid4())  # one Idempotency-Key per invocation: a retry never sends twice
+    if "session" not in body and os.environ.get("KABU_AUTO_SESSION") == "1":
+        auto_session(api, body, key)
+    if files:
+        body["attachments"] = [{"media": api.upload(f, f"{key}-file-{i}")} for i, f in enumerate(files, 1)]
+    msg = api.call("POST", "/v2/messages", body, wait=WAIT if cmd == "ask" and not a["no_wait"] else 0, idem=key)
+    if cmd == "send" or a["no_wait"]:
+        done: JSON = {"attachments": len(files)} if cmd == "send" else {"outcome": "pending"}
+        return emit({"ok": True, "id": msg.get("id"), "status": msg.get("status"), **done})
+    mid, deadline = str(msg.get("id")), time.monotonic() + body["expires_in"] + GRACE  # the API settles an ask at expiry
+    hint = f"The ask is still open, so never ask it again; wait for its answer with: kabu status {mid} --wait 50"
+    while msg.get("status") == "pending":
+        if time.monotonic() > deadline:
+            raise CliError("ask_pending", f"No answer to {mid} by its expiry; kabu stopped waiting.", hint, EXIT_TRANSPORT, {"id": mid})
+        try:
+            msg = api.call("GET", "/v2/messages/" + urllib.parse.quote(mid, safe=""), wait=WAIT)
+        except CliError as e:  # a network blip, 5xx or 429 only delays the wait; a refusal ends it
+            if 400 <= e.extra.get("status", 0) < 500 and e.extra["status"] != 429:
+                raise CliError(e.code, e.message, hint, e.exit, {**e.extra, "id": mid}) from None
+            time.sleep(5)
+    summary, code = classify_ask_outcome(msg, body["ask"]["type"])
+    return emit(summary, code, sort=True)
+
+
+def auto_session(api: Api, body: JSON, key: str) -> None:
+    """KABU_AUTO_SESSION=1: one session per host, project and agent groups their messages. One try of up to 3 s; an ended
+    or expired session (the API returns a run's session even then), or any failure, sends the message without one."""
+    host, project, agent = socket.gethostname().split(".")[0], body["project"], body["agent"]
+    try:
+        session = Api(api.base, api.key, 3.0, 0).call("POST", "/v2/sessions", {
+            "title": f"{agent} on {host} · {project}"[:80], "project": project, "agent": agent,
+            "external_id": f"auto:{host}:{project}:{agent}"[:120]}, idem=f"{key}-session")
+    except CliError:
+        return  # a session only groups messages: it never stops one
+    if isinstance(session.get("id"), str) and session.get("status") not in ("ended", "expired") and not session.get("ended_at"):
+        body["session"] = session["id"]
+
+
+def cmd_session(cmd: str, a: JSON) -> int:
+    """session start (get or create, with a Live Activity), update or end."""
+    body, action = check(cmd, COMMANDS[cmd].opts, a), cmd.split()[1]
+    update = {k: body.pop(k) for k in ("headline", "progress") if k in body}  # what session update takes
+    if action != "start":
+        sid = the_id(cmd, a["id"], "ses_", "KABU_SESSION")
+        if action == "end":
+            return emit(Api.connect(a).call("POST", f"/v2/sessions/{sid}/end", body, idem=str(uuid.uuid4())))
+        if not update:
+            raise CliError("missing_flag", "Nothing to update.", "Example: kabu session update --headline 'Running tests' --progress 3/8")
+        return emit(Api.connect(a).call("PATCH", f"/v2/sessions/{sid}", update))
+    if not a["title"]:
+        raise CliError("missing_flag", "kabu session start needs --title.", 'Example: kabu session start --title "Fix flaky auth test"')
+    api = Api.connect(a)
+    session = api.call("POST", "/v2/sessions", {**body, "live": {"enabled": True}}, idem=str(uuid.uuid4()))
+    if session.get("status") == "ended":  # get-or-create found this --external-id's session, already over
+        raise CliError("session_ended", f"The session of --external-id {a['external_id']} has ended.",
+                       "Start another with a new --external-id.", EXIT_TRANSPORT)
+    if update:
+        session = api.call("PATCH", "/v2/sessions/" + urllib.parse.quote(str(session.get("id")), safe=""), update)
+    return emit(session)
+
+
+def cmd_status(cmd: str, a: JSON) -> int:
+    check(cmd, STATUS, a)
+    return emit(Api.connect(a).call("GET", "/v2/messages/" + the_id(cmd, a["id"], "msg_"), wait=a["wait"] or 0))
+
+
+def cmd_whoami(cmd: str, a: JSON) -> int:
+    check(cmd, CONNECTION, a)
+    api = Api.connect(a)
+    capabilities = api.call("GET", "/v2")
+    try:
+        org: Optional[JSON] = api.call("GET", "/v2/org")
+    except CliError:
+        org = None  # GET /v2/org needs org:write, which agent keys lack; GET /v2/me takes only a signed-in human
+    return emit({"ok": True, "capabilities": capabilities, "org": org, "org_name": (org or {}).get("name") or load_config().get("org_name"),
+                 "project": detect_project(), "agent": resolve_agent(), "base_url": api.base, "config_path": str(default_config_path())})
+
+
+def device_login(api: Api, name: str) -> JSON:
+    """RFC 8628: print a code for a person to approve in Kabu, then poll for this computer's own key."""
+    auth = api.call("POST", "/v2/device_authorizations", {"name": name})
+    print(f"Open {auth.get('verification_uri_complete')} and approve code {auth.get('user_code')} in Kabu.", file=sys.stderr, flush=True)
+    form = {"device_code": str(auth.get("device_code", "")), "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}
+    interval, deadline = float(auth.get("interval", 5)), time.monotonic() + float(auth.get("expires_in", 600))
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        try:
+            return api.call("POST", "/v2/device_authorizations/poll", form=form)
+        except CliError as e:  # the API answers a poll with an OAuth error code only
+            if e.code == "access_denied":
+                raise CliError(e.code, "The code was denied in Kabu.", "Run kabu login --device again.", EXIT_REJECTED) from None
+            if e.code == "expired_token":
+                break
+            if e.code not in ("authorization_pending", "slow_down"):
+                raise
+            interval += 5 if e.code == "slow_down" else 0
+    raise CliError("expired_token", "The code expired before anyone approved it.", "Run kabu login --device again.", EXIT_EXPIRED)
+
+
+def cmd_login(cmd: str, a: JSON) -> int:
+    """Save a key (--api-key, or typed at a terminal) or get this computer's own (--device), and the defaults given."""
+    if a["api_key"] == "-":
+        a["api_key"] = sys.stdin.buffer.readline().decode("utf-8", "replace")
+    a["api_key"] = a["api_key"] and a["api_key"].strip()  # a key file with Windows line endings leaves a \r
+    check(cmd, LOGIN, a)
+    if a["api_key"] and a["device"]:
+        raise CliError("conflicting_flags", "Give --api-key or --device, not both.", "Example: kabu login --device")
+    cfg = load_config()
+    cfg.update(base_url=base_url(a["base_url"], cfg), **{k: a[k] for k in ("project", "agent") if a[k]})
+    known: JSON = {}
+    if a["device"]:
+        token = device_login(Api(cfg["base_url"]), a["name"])
+        known = {k: token[k] for k in ("org_name", "project") if token.get(k)}
+        cfg.update(api_key=str(token.get("access_token", "")), **({"org_name": known["org_name"]} if "org_name" in known else {}))
+    else:
+        typed = "" if a["api_key"] or not sys.stdin.isatty() else getpass.getpass("Kabu API key: ").strip()
+        if not a["api_key"] and not typed:
+            raise CliError("missing_flag", "kabu login needs --device or --api-key.", "Example: kabu login --device")
+        cfg["api_key"] = a["api_key"] or value(cmd, KEY, typed)
+    return emit({"ok": True, **known, "config_path": str(save_config(cfg))})
+
+
+def cmd_mcp(cmd: str, a: JSON) -> int:
+    """Bridge a harness's stdio MCP to the API's /mcp with the saved key (CONTRACT.md, MCP bridge). Logs go to stderr."""
+    import threading
+
+    check(cmd, CONNECTION, a)
+    api = Api.connect(a)
+    url, out = api.base + "/mcp", threading.Lock()
+    session: Dict[str, str] = {}  # the Mcp-Session-Id the server issued, sent on every later request
+
+    def write(reply: Any) -> None:
+        with out:
+            try:
+                print(json.dumps(reply), flush=True)
+            except OSError:
+                pass  # the harness has gone, and stdin ends next
+
+    def relay(line: bytes, show: Callable[[Any], None]) -> None:
+        """POST one message, and show each message of the reply as it comes: the JSON body, or each event of a stream."""
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                   "Authorization": f"Bearer {api.key}", "User-Agent": f"kabu-cli/{VERSION}", **session}
+        with OPEN(urllib.request.Request(url, line, headers, method="POST"), timeout=api.timeout + WAIT) as resp:
+            if resp.headers.get("Mcp-Session-Id"):
+                session["Mcp-Session-Id"] = resp.headers["Mcp-Session-Id"]
+            if "text/event-stream" not in resp.headers.get("Content-Type", ""):
+                body = resp.read()
+                if body.strip():  # a notification's 202 has none
+                    show(json.loads(body))
+                return
+            data: List[str] = []
+            for raw in resp:  # an event stream: the data lines of each event are one message
+                text = raw.decode().rstrip("\r\n")
+                if text.startswith("data:"):
+                    data.append(text[5:].removeprefix(" "))
+                elif not text and data:
+                    show(json.loads("\n".join(data)))
+                    data = []
+
+    def forward(line: bytes, msg: Any) -> None:
+        """Relay one message. On failure, log it, and answer a request that has no answer yet with a JSON-RPC error:
+        the harness never hangs, and never gets two answers for one id."""
+        rid = msg.get("id") if isinstance(msg, dict) and "method" in msg else None  # a request's id: it wants an answer
+        answered = False
+
+        def show(reply: Any) -> None:
+            nonlocal answered
+            write(reply)
+            answered = answered or isinstance(reply, dict) and "method" not in reply and reply.get("id") == rid
+
+        try:
+            relay(line, show)
+            if answered or rid is None:
+                return
+            raise ValueError("no answer")  # an empty body, or a stream that ended without the response
+        except urllib.error.HTTPError as exc:
+            e = Api.problem(exc, "POST", url, RETRIES)[0]
+        except ValueError:
+            e = CliError("bad_response", f"POST {url} did not answer with JSON-RPC.", "Check that KABU_BASE_URL points at the Kabu API.")
+        except (OSError, http.client.HTTPException) as exc:  # refused, reset, timed out
+            e = CliError("network_error", f"POST {url} failed: {getattr(exc, 'reason', exc)}.", "Check the network and KABU_BASE_URL.")
+        printed = error_line(e)
+        print(printed, file=sys.stderr, flush=True)
+        if rid is not None and not answered:
+            shown = json.loads(printed)["error"]  # as redacted: message and hint, then the code and the rest as data
+            write({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": f"{shown.pop('message')} {shown.pop('hint')}",
+                                                          "data": shown}})
+
+    pending: List[threading.Thread] = []
+    for line in filter(None, (raw.strip() for raw in sys.stdin.buffer)):
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = None  # sent as it is: the server answers with a parse error
+        if isinstance(msg, dict) and "method" in msg and "id" in msg:  # a request runs alongside the others
+            pending = [t for t in pending if t.is_alive()] + [threading.Thread(target=forward, args=(line, msg), daemon=True)]
+            pending[-1].start()
+        else:  # notifications and replies keep their order
+            forward(line, msg)
+    for thread in pending:
+        thread.join()
+    return EXIT_OK
+
+
+@dataclass(frozen=True)
+class Command:
+    handler: Callable[[str, JSON], int]
+    about: str
+    examples: str
+    opts: Tuple[Opt, ...]
+    positional: Tuple[str, ...] = ()  # name, nargs, help
+
+
+COMMANDS = {
+    "send": Command(cmd_message, "Notify a human. Prints {ok, id, status, attachments}.", """\
+  kabu send "Tests passed" "412 passed, 0 failed" --file report.png --link "PR=https://github.com/o/r/pull/7"
+  kabu send "Nightly report" - < report.md
+  git diff | kabu send "Review this" --diff - --diff-path src/app.py""", MESSAGE, TEXT_ARG),
+    "ask": Command(cmd_message, "Ask a human and wait. Exit 0 approved or a choice or text given; 10 rejected; 20 expired; 21 cancelled.", """\
+  kabu ask "Deploy to prod?"                  approve (exit 0) or reject (exit 10)
+  kabu ask "Which env?" -c staging -c prod    a choice: exit 0 whatever is chosen, so branch on .option
+  kabu ask "Release name?" --type text        the answer's text is what they typed
+  kabu ask "Run it?" --action db.migrate --args '{"version": 42}' --irreversible""", MESSAGE, TEXT_ARG),
+    "status": Command(cmd_status, "Print a message as the API has it; exit 0 whatever the answer, so read .resolution.decision.", """\
+  kabu status msg_01J9Z --wait 50     hold up to 50 s while an ask is pending""", STATUS, ("id", "?", "a msg_… id")),
+    "whoami": Command(cmd_whoami, "Print what the key can do (GET /v2), its org, and the project and agent kabu would send.", """\
+  kabu whoami""", CONNECTION),
+    "session start": Command(cmd_session, "Get or create a running session with a Live Activity. Prints the session.", """\
+  export KABU_SESSION=$(kabu session start --title "Fix flaky auth test" | jq -r .id)
+  kabu session start --title "Nightly build" --external-id run-77 --headline "Compiling" --progress 1/4""",
+                             SESSION_CREATE + SESSION_UPDATE + CONNECTION),
+    "session update": Command(cmd_session, "Update a session's Live Activity. Prints the session.", """\
+  kabu session update --headline "Running tests" --progress 3/8 --progress-label tests""", SESSION_UPDATE + CONNECTION, SESSION_ID),
+    "session end": Command(cmd_session, "End a session; its pending asks are cancelled. Prints the session.", """\
+  kabu session end --outcome success --summary "PR opened"
+  kabu session end ses_01J9Z --outcome failure --dismiss-after 0""", SESSION_END, SESSION_ID),
+    "login": Command(cmd_login, "Save a key and defaults to the config file (mode 600). Exit 10: code denied; 20: expired.", """\
+  kabu login --device                   prints a code to approve in Kabu, then saves this computer's key
+  kabu login --api-key - < key.txt      no prompt; with no flag at a terminal, kabu asks for the key""", LOGIN),
+    "mcp": Command(cmd_mcp, "Serve Kabu's MCP tools on stdin and stdout for a harness that starts it, through the API's /mcp "
+                   "and the saved key. Exit 0 when stdin closes.", """\
+  claude mcp add kabu -- kabu mcp       Claude Code; the kabu plugin adds it for you
+  copilot mcp add kabu -- kabu mcp      GitHub Copilot CLI
+  echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | kabu mcp""", CONNECTION),
+}
+
+
+def run(args: List[str]) -> int:
+    """A command, its help, the version or the guide; with no command, kabu.py's form."""
+    if not args:
+        raise CliError("missing_command", "kabu needs a command or a message.", 'Run: kabu --help, or: kabu send "Build passed"')
+    head = args[0]
+    if head in ("-h", "--help") or args[:2] == ["session", "--help"]:
+        print(__doc__)
+        return EXIT_OK
+    if head == "--version":
+        print(f"kabu {VERSION}")
+        return EXIT_OK
+    if head == "guide" or args[:2] == ["help", "agents"]:  # the rules, then every command's examples
+        print(__doc__ + GUIDE + "".join(f"\n\nkabu {name}: {c.about}\n{c.examples}" for name, c in COMMANDS.items()))
+        return EXIT_OK
+    if head == "help":
+        if args[1:] and args[1] not in NAMES:
+            raise CliError("unknown_command", f"kabu has no {args[1]!r} command.", "Run: kabu --help")
+        return run(args[1:] + ["--help"])
+    name = " ".join(args[:2]) if head == "session" else head
+    if name in COMMANDS:
+        return COMMANDS[name].handler(name, parse(name, args[len(name.split()):]))
+    if head == "session":
+        close = difflib.get_close_matches(" ".join(args[1:2]), ("start", "update", "end"), n=1)
+        raise CliError("unknown_command", f"kabu session takes start, update or end, not {' '.join(args[1:2])!r}."
+                       + (f" Did you mean {close[0]!r}?" if close else ""), 'Example: kabu session start --title "Fix auth"')
+    if head in LEGACY:  # never a message: a steering LaunchAgent may still run `kabu.py daemon`
+        raise CliError("unknown_command", f"kabu has no {head!r} command: kabu.py's steering ({', '.join(LEGACY[:5])}) and project "
+                       "settings are not in kabu.", f"Use the legacy kabu.py 0.2.0 for it. To send the word itself: kabu send {head}")
+    close = difflib.get_close_matches(head, NAMES, n=1, cutoff=0.75) if head.isalpha() else []
+    if close:
+        raise CliError("unknown_command", f"kabu has no {head!r} command. Did you mean {close[0]!r}?",
+                       f"Run: kabu {close[0]} --help (to send the word itself: kabu send {head})")
+    cmd = "ask" if {arg.split("=", 1)[0] for arg in args} & {"--ask", "--ask-text"} else "send"
+    a = parse(cmd, args)
+    if a["ask"] and not a["type"] and not a["allow_reply"] and tuple(c.strip().lower() for c in a["choice"]) in YES_NO:
+        a["type"] = "confirm"  # the first approves (exit 0), the second rejects (exit 10); any other pair stays a choice
+    return cmd_message(cmd, a)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        return run(list(sys.argv[1:] if argv is None else argv))
+    except CliError as e:
+        error = e
+    except (OSError, ValueError, RuntimeError) as exc:  # a local failure kabu could not foresee, such as an unwritable config
+        error = CliError("local_error", f"{type(exc).__name__}: {exc}.", "Check the file, permission or setting it names.")
+    except SystemExit as e:  # argparse after --help
+        return e.code if isinstance(e.code, int) else EXIT_OK
+    except KeyboardInterrupt:
+        return 130
+    print(error_line(error), file=sys.stderr)
+    return error.exit
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,20 @@
+{
+  "name": "kabu",
+  "version": "2.2.0",
+  "description": "Reach yourself on your phone from your coding agent: notifications, approvals, choices and typed replies, Live Activity progress, and Kabu's MCP tools.",
+  "author": {
+    "name": "NexAI Tech",
+    "url": "https://usekabu.com"
+  },
+  "homepage": "https://usekabu.com",
+  "repository": "https://github.com/ai-agentics/plugins",
+  "license": "MIT",
+  "keywords": [
+    "notifications",
+    "approvals",
+    "human-in-the-loop",
+    "mobile",
+    "live-activity",
+    "mcp"
+  ]
+}
