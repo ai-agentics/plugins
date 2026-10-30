@@ -1,0 +1,61 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: The catalogue and every plugin agree
+        shell: python3 {0}
+        run: |
+          import json, pathlib, re, sys
+
+          problems = []
+          market = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text())
+          names = [entry["name"] for entry in market["plugins"]]
+          folders = sorted(p.name for p in pathlib.Path("plugins").glob("*") if p.is_dir())  # none yet: an empty list
+          if sorted(names) != folders:
+              problems.append(f"marketplace plugins {sorted(names)} differ from plugins/ folders {folders}")
+          for entry in market["plugins"]:
+              name, root = entry["name"], pathlib.Path("plugins", entry["name"])
+              if entry.get("source") != f"./plugins/{name}":
+                  problems.append(f"{name}: source must be ./plugins/{name}")
+              if not (root / ".claude-plugin" / "plugin.json").is_file():
+                  problems.append(f"{name}: plugins/{name}/.claude-plugin/plugin.json is missing")
+                  continue
+              manifest = json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+              for key in ("name", "version", "description"):
+                  if manifest.get(key) != entry.get(key):
+                      problems.append(f"{name}: {key} differs between plugin.json and the marketplace")
+              for config in ("hooks/hooks.json", ".mcp.json"):
+                  if (root / config).exists():
+                      json.loads((root / config).read_text())
+              for skill in sorted(root.glob("skills/*/SKILL.md")):
+                  head = re.match(r"---\n(.*?)\n---\n", skill.read_text(), re.S)
+                  fields = dict(line.split(":", 1) for line in head.group(1).splitlines() if ":" in line) if head else {}
+                  if fields.get("name", "").strip() != skill.parent.name or not skill.parent.name.startswith(f"{name}-"):
+                      problems.append(f"{skill}: name must be its folder's, and start with {name}-")
+                  if not fields.get("description", "").strip():
+                      problems.append(f"{skill}: no description")
+          print("\n".join(problems) or "manifests ok")
+          sys.exit(1 if problems else 0)
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Claude Code's plugin validator
+        run: |
+          npm install --global @anthropic-ai/claude-code@2.1.308  # the version validated with; bump it on purpose
+          claude plugin validate --strict .
+          for plugin in plugins/*/; do claude plugin validate --strict "$plugin"; done
