@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""kabu: notify a human and ask them, from any script or coding agent (Kabu API v2).
+"""kabu: notify a human and ask them through the Kabu app, from any script or coding agent.
 
 Commands:
   kabu send [TITLE] MESSAGE     notify; `kabu "message"` with no command does the same
@@ -15,7 +15,7 @@ Commands:
 Output is one JSON object on stdout. An error is one JSON line on stderr, {"error": {"code", "message", "hint"}};
 the hint is the next step, usually a corrected command. Nothing is ever coloured.
 Exit codes: 0 ok (an ask approved, or a choice or text answered), 2 usage or validation error (nothing was sent),
-3 network or API error, or an answer kabu does not know, 10 rejected, 20 expired, 21 cancelled, 130 interrupted.
+3 network or API error, or an answer kabu does not know, 10 rejected, 20 expired, 21 cancelled or deleted, 130 interrupted.
 Environment: KABU_API_KEY, KABU_BASE_URL (default https://usekabu.com), KABU_PROJECT, KABU_AGENT, KABU_SOURCE,
 KABU_SESSION, KABU_AUTO_SESSION=1 (one session per host, project and agent), KABU_CONFIG_PATH (default
 ~/.config/kabu/config.json, written by kabu login, mode 600).
@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import difflib
+import functools
 import getpass
 import hashlib
 import http.client
@@ -42,9 +43,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.2.0"
+VERSION = "2.4.0"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -128,6 +129,9 @@ def base_url(flag: Optional[str], cfg: JSON) -> str:
 
 
 PROJECT_ENV_KEYS = ("KABU_PROJECT", "AGENT_NOTIFIER_PROJECT")
+TEMP_DIRS = tuple({Path(d).resolve() for d in ("/tmp", "/var/tmp", "/var/folders", os.environ.get("TMPDIR") or "/tmp")})
+KEPT_DAYS = 7  # an agent session's kept project is removed once unused this long
+PROC = Path("/proc")  # Linux's process files
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -171,14 +175,19 @@ def _git_roots(cwd: Path) -> Tuple[Optional[Path], Optional[Path]]:
     return Path(top).resolve(), main.resolve()
 
 
-def detect_project(cwd: Optional[Path] = None) -> str:
-    """Resolve the project name without a ``--project`` flag; see CONTRACT.md."""
-    cwd = (cwd or Path.cwd()).resolve()
-    for k in PROJECT_ENV_KEYS:
-        if os.environ.get(k, "").strip():
-            return os.environ[k].strip()
-    top, main = _git_roots(cwd)
-    dirs = [cwd]  # from here up to the repository's top, then the main worktree's
+def is_temp(folder: Path) -> bool:
+    """A temp folder, or one inside it: it never names a project."""
+    return any(folder == d or d in folder.parents for d in TEMP_DIRS)
+
+
+def named_project(folder: Path) -> Tuple[str, str]:
+    """The project a folder names, and how: KABU_PROJECT in .env.local or .env from the folder up to its repository's top,
+    then the main worktree's ("dotenv"); else the git repository's name ("git"). ("", "") when it names none, as a temp
+    folder does unless it is a worktree of a repository whose main worktree is outside the temp folders."""
+    top, main = _git_roots(folder)
+    if is_temp(folder) and (main is None or is_temp(main)):
+        return "", ""
+    dirs = [folder]  # from here up to the repository's top, then the main worktree's
     while top is not None and dirs[-1] != top and dirs[-1].parent != dirs[-1]:
         dirs.append(dirs[-1].parent)
     if main is not None and main not in dirs:
@@ -187,14 +196,111 @@ def detect_project(cwd: Optional[Path] = None) -> str:
         for name in (".env.local", ".env"):
             found = _read_dotenv_project(d / name)
             if found:
-                return found
-    if main is not None:  # the origin remote's repository name, else the main worktree's folder name
-        name = _git(cwd, "config", "--get", "remote.origin.url").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-        return (name[:-4] if name.endswith(".git") else name) or main.name
+                return found, "dotenv"
+    if main is None:
+        return "", ""
+    name = _git(folder, "config", "--get", "remote.origin.url").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return (name[:-4] if name.endswith(".git") else name) or main.name, "git"
+
+
+def resolve_project(cwd: Optional[Path] = None) -> Tuple[Optional[str], JSON]:
+    """The project to send without --project (None: the API picks), and the rule that named it (CONTRACT.md, Project
+    resolution): the environment, the agent session's root, what the session kept, this folder, the login, a name."""
+    for k in PROJECT_ENV_KEYS:
+        if os.environ.get(k, "").strip():
+            return os.environ[k].strip(), {"rule": "env", "variable": k}
+    agent = harness()
+    seen: JSON = {"harness": agent[2]} if agent else {}
+    variable = {"variable": "CLAUDE_PROJECT_DIR"} if os.environ.get("CLAUDE_PROJECT_DIR") else {}
+    found = Path(os.environ["CLAUDE_PROJECT_DIR"]) if variable else process_cwd(agent[0]) if agent else None
+    root = str(found.resolve()) if found else ""
+    kept = cache_dir() / "sessions" / f"{session_key(agent)}.json" if session_key(agent) else None
+    if kept is not None:
+        try:
+            entry = json.loads(kept.read_text(encoding="utf-8"))
+            if entry["root"] == root:  # read back while the root is the folder it was named under; moved, resolve again
+                kept.touch()  # in use: kept for another KEPT_DAYS
+                return str(entry["project"]), {**entry["source"], "cached": True}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # not kept yet, or unreadable: resolve again
+    folders = [("session_root", Path(root))] if root else []
+    try:
+        folders.append(("cwd", (cwd or Path.cwd()).resolve()))
+    except OSError:
+        pass  # the current folder was removed: it names nothing, and the root may still
+    for rule, folder in folders:
+        name, via = named_project(folder)
+        if name:
+            source = {"rule": rule, **seen, "dir": str(folder), "via": via, **(variable if rule == "session_root" else {})}
+            if kept is not None:  # for the session's later calls; files no session used for KEPT_DAYS go
+                write_cache(kept, json.dumps({"project": name, "source": source, "root": root}), time.time() - KEPT_DAYS * 86400)
+            return name, source
     saved = load_config().get("project")
     if isinstance(saved, str) and saved.strip():
-        return saved.strip()
-    return f"{cwd.name or 'default'}@{socket.gethostname().split('.', 1)[0] or 'host'}"
+        return saved.strip(), {"rule": "login", **seen}
+    home, host = Path(os.path.expanduser("~")).resolve(), socket.gethostname().split(".", 1)[0] or "host"
+    for rule, folder in folders:  # never a name for /, the home folder, a missing folder (Linux: "… (deleted)") or a temp one
+        if folder.parent != folder and folder != home and folder.is_dir() and not is_temp(folder):
+            return f"{folder.name}@{host}", {"rule": "folder", **seen, "dir": str(folder)}
+    return None, {"rule": "default", **seen}
+
+
+def harness() -> Optional[Tuple[int, str, str]]:
+    """The agent session kabu runs in: its harness, the nearest ancestor named as one (process id, start time, name)."""
+    return next((p for p in ancestors() if p[2] in AGENT_PROCESSES), None)
+
+
+def session_key(agent: Optional[Tuple[int, str, str]]) -> str:
+    """An agent session's key: its harness's process id and a hash of its start time, so a reused id never matches;
+    "" when there is no harness or its start time is unknown."""
+    return f"{agent[0]}-{hashlib.sha256(agent[1].encode()).hexdigest()[:16]}" if agent and agent[1] else ""
+
+
+def cache_dir() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "kabu"
+
+
+def write_cache(path: Path, text: str, stale: float = 0) -> None:
+    """Write a file of kabu's cache, after removing the files of its folder unused since `stale`, a time. The cache only
+    saves work, so a failure, or a file read half written, only means resolving again."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for old in path.parent.iterdir() if stale else ():
+            try:
+                if old.stat().st_mtime < stale:
+                    old.unlink()
+            except OSError:
+                pass  # gone meanwhile, by another call's clean-up, or a folder: never in the way of the write
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def gone_sessions(base: str) -> Tuple[Path, List[str]]:
+    """The sessions the API at `base` reported gone (deleted with their project), which kabu never names again, and their
+    file: one per base URL, as one API's ids mean nothing to another's."""
+    path = cache_dir() / f"gone-{hashlib.sha256(base.encode()).hexdigest()[:12]}"
+    try:
+        return path, path.read_text(encoding="utf-8").split()
+    except OSError:
+        return path, []
+
+
+def process_cwd(pid: int) -> Optional[Path]:
+    """A process's working folder, or None: /proc on Linux; on macOS, libproc's proc_pidinfo, which lsof calls, in 0.3 ms
+    where lsof took 0.3 s and more."""
+    try:
+        if sys.platform != "darwin":
+            return Path(os.readlink(f"/proc/{pid}/cwd"))
+        import ctypes
+        size, at = 2352, 152  # struct proc_vnodepathinfo: the cwd's struct vnode_info, then its path, MAXPATHLEN 1024
+        info = ctypes.create_string_buffer(size)
+        if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo(pid, 9, 0, info, size) != size:  # 9: PROC_PIDVNODEPATHINFO
+            return None
+        path = info.raw[at:at + 1024].split(b"\0", 1)[0]
+        return Path(os.fsdecode(path)) if path else None
+    except (OSError, ValueError, ImportError, AttributeError):  # gone, another user's, no libproc, or a Python without ctypes
+        return None
 
 
 # Process names of agent harnesses, looked for among kabu's ancestors.
@@ -206,20 +312,44 @@ AGENT_VARIABLES = {"CLAUDECODE": "claude-code", "CLAUDE_CODE_ENTRYPOINT": "claud
                    "PI_CODING_AGENT": "pi"}
 
 
-def ancestors() -> List[str]:
-    """The executable names of kabu's ancestor processes, nearest first. Names only: arguments can hold secrets."""
-    try:
-        listing = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    rows = re.findall(r"^\s*(\d+)\s+(\d+)\s+(.+)$", listing, re.MULTILINE)
-    parents = {int(pid): (int(ppid), Path(comm).name.lower()) for pid, ppid, comm in rows}
-    names: List[str] = []
+@functools.lru_cache(maxsize=None)
+def ancestors() -> Tuple[Tuple[int, str, str], ...]:
+    """kabu's ancestor processes, nearest first: process id, start time ("" when unknown) and executable name. Names only:
+    arguments can hold secrets. The start time tells a process from a later one that reuses its id. Linux: /proc, read
+    with the boot id; elsewhere one ps call, which may not show start times (BusyBox), and names are enough then."""
+    procs: Dict[int, Tuple[int, str, str]] = {}  # pid: (parent pid, start, name)
+    if (PROC / "self" / "stat").exists():
+        try:
+            boot = (PROC / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
+        except OSError:
+            boot = ""
+        pid = os.getppid()
+        while pid > 0 and pid not in procs and len(procs) < 32:
+            try:
+                stat = (PROC / str(pid) / "stat").read_text(errors="replace")
+            except OSError:
+                break
+            rest = stat[stat.rindex(")") + 2:].split()  # the fields after the name, which may hold spaces or parentheses
+            procs[pid] = (int(rest[1]), f"{boot}:{rest[19]}" if boot else "", stat[stat.index("(") + 1:stat.rindex(")")].lower())
+            pid = procs[pid][0]
+    starts = (("pid=,ppid=,lstart=,comm=", r"(\w+ +\w+ +\d+ +[\d:]+ +\d+) +"), ("pid=,ppid=,comm=", "()"))  # with, then without
+    for columns, start in () if procs else starts:
+        try:
+            listing = subprocess.run(["ps", "-A", "-o", columns], capture_output=True, text=True, errors="replace", timeout=2,
+                                     env={**os.environ, "LC_ALL": "C", "TZ": "UTC0"}).stdout  # one format for start times
+        except (OSError, subprocess.SubprocessError):
+            break
+        rows = re.findall(r"^\s*(\d+)\s+(\d+)\s+" + start + r"(.+)$", listing, re.MULTILINE)
+        procs = {int(pid): (int(ppid), " ".join(when.split()), Path(comm).name.lower()) for pid, ppid, when, comm in rows}
+        if procs:
+            break
+    found: List[Tuple[int, str, str]] = []
     pid = os.getppid()
-    while pid in parents and len(names) < 32:
-        pid, name = parents[pid]
-        names.append(name)
-    return names
+    while pid in procs and len(found) < 32:
+        ppid, start, name = procs[pid]
+        found.append((pid, start, name))
+        pid = ppid
+    return tuple(found)
 
 
 def detect_agent(env: Mapping[str, str], names: Sequence[str]) -> str:
@@ -232,7 +362,8 @@ def detect_agent(env: Mapping[str, str], names: Sequence[str]) -> str:
 
 def resolve_agent(flag: Optional[str] = None) -> str:
     """--agent, KABU_AGENT (or AGENT_NOTIFIER_AGENT), the agent saved by kabu login, then the harness detected."""
-    return resolve_setting(flag, ("KABU_AGENT", "AGENT_NOTIFIER_AGENT"), load_config(), "agent") or detect_agent(os.environ, ancestors())
+    return resolve_setting(flag, ("KABU_AGENT", "AGENT_NOTIFIER_AGENT"), load_config(), "agent") or detect_agent(
+        os.environ, [name for _, _, name in ancestors()])
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -414,8 +545,8 @@ CONNECTION = (
     Opt(("--timeout",), "seconds to wait for each response, 1 to 600 (default 30)", "30", kind="float", bounds=(1, 600), metavar="SECONDS"),
     Opt(("--json",), "ignored: kabu always prints one JSON object (kabu.py's flag)", kind="flag"),
 )
-PROJECT = Opt(("--project", "-p"), "project, max 64 (default: KABU_PROJECT, .env, the repo name)", "payments-api", path="project", limit=64,
-              default=detect_project)
+PROJECT = Opt(("--project", "-p"), "project, max 64 (default: KABU_PROJECT, else your agent session's repo: see kabu whoami)",
+              "payments-api", path="project", limit=64)
 AGENT = Opt(("--agent", "-a"), "agent, max 64 (default: KABU_AGENT, the login's, the harness)", "claude-code", path="agent", limit=64,
             default=resolve_agent)
 MESSAGE = (
@@ -486,7 +617,8 @@ KEY = Opt(("--api-key",), "the key to save (kabu_live_sk_… or kabu_test_sk_…
           pattern=r"kabu_[A-Za-z0-9_]+")
 LOGIN = (
     KEY,
-    Opt(("--device",), "connect this computer: approve a code in Kabu, and its own key is saved", kind="flag"),
+    Opt(("--device",), "connect this computer: enter the code it prints in the Kabu app's Connect a computer; its own key is saved",
+        kind="flag"),
     Opt(("--name",), "the computer's name shown when approving, max 80 (default: the hostname)", "work-laptop", limit=80,
         default=lambda: socket.gethostname().split(".")[0][:80]),
     Opt(("--base-url",), "API base URL to save (default: KABU_BASE_URL, the saved one, https://usekabu.com)", "https://usekabu.com"),
@@ -513,8 +645,10 @@ GUIDE = """\nFor coding agents:
 - With -c it is a choice, which exits 0 whatever is chosen: branch on .option, never on the exit code.
 - If a tool call may time out before a human answers: kabu ask … --no-wait, then kabu status ID --wait 50.
   kabu status exits 0 whatever the answer: read .status and .resolution.decision.
-- An error that names an ask's id means the ask is still open: wait with kabu status ID --wait 50, never ask again.
-- Project and agent are detected (KABU_PROJECT and KABU_AGENT override); KABU_SESSION puts messages in a session.
+- Exit 3 with an error that names an ask's id: the ask is still open, so wait with kabu status ID --wait 50, never ask
+  again. Exit 21 with ask_gone: it was deleted with its project and will never be answered; ask again if still needed.
+- The project is your agent session's (the repo it started in) whatever folder kabu runs in, never a temp folder's;
+  .project_source says why. KABU_PROJECT and KABU_AGENT override; KABU_SESSION puts messages in a session.
 - kabu.py's calls work too: kabu --title T "message" --file-path X; kabu --ask Q -c Yes -c No is yes or no (No exits 10)."""
 
 
@@ -681,8 +815,8 @@ def ask_body(a: JSON) -> JSON:
     return {"type": kind, "options": options, **({"min": 1, "max": len(options)} if kind == "multi" else {})}
 
 
-def build_message(cmd: str, a: JSON) -> Tuple[JSON, List[Path]]:
-    """The validated request body and files for send or ask. No HTTP call."""
+def build_message(cmd: str, a: JSON) -> Tuple[JSON, List[Path], JSON]:
+    """The validated request body and files for send or ask, and the project and its source. No HTTP call."""
     if a["project"] in PRIORITY_NUMBERS:  # kabu.py's -p was its priority
         raise CliError("invalid_value", f"--project {a['project']!r} looks like kabu.py's -p priority; in kabu, -p is --project.",
                        f"Example: kabu {SAMPLES[cmd]} --priority {PRIORITY_NUMBERS[a['project']]}")
@@ -701,11 +835,21 @@ def build_message(cmd: str, a: JSON) -> Tuple[JSON, List[Path]]:
     if asking:
         body["ask"] = {**ask_body(a), **body.get("ask", {})}
         body.setdefault("expires_in", 300)
+    source = with_project(cmd, body)  # last, for a valid command only: it is the slowest step
     size = len(utf8_json(body)) + 64 * (len(a["file"]) + 1)  # and room for the media and session ids added later
     if size > REQUEST_MAX:
         raise CliError("too_large", f"The request comes to {size} bytes; the API takes up to {REQUEST_MAX} (64 KiB of UTF-8 JSON).",
                        f'Shorten the text, or attach it. Example: kabu {cmd} "Nightly report" "Summary" --file report.md')
-    return body, a["file"]
+    return body, a["file"], {"project": body.get("project"), "project_source": source}
+
+
+def with_project(cmd: str, body: JSON) -> JSON:
+    """Put the resolved project in a request body that has none from --project, checked as --project is; its source."""
+    if "project" in body:
+        return {"rule": "flag"}
+    project, source = resolve_project()
+    body.update({"project": value(cmd, PROJECT, project)} if project else {})
+    return source
 
 
 def the_id(cmd: str, raw: Optional[str], prefix: str, env: str = "") -> str:
@@ -736,20 +880,26 @@ def classify_ask_outcome(msg: JSON, kind: str) -> Tuple[JSON, int]:
 
 def cmd_message(cmd: str, a: JSON) -> int:
     """send or ask: upload the files, create the message and, for an ask, wait until it settles."""
-    body, files = build_message(cmd, a)
+    body, files, context = build_message(cmd, a)
     api = Api.connect(a)
+    gone = body.pop("session") if "session" in body and body["session"] in gone_sessions(api.base)[1] else None  # one stands in
     if a["dry_run"]:  # the API validates it and renders each surface; nothing is uploaded or sent
         return emit({"ok": True, "dry_run": True, "request": body, "files": [str(f) for f in files],
-                     "preview": api.call("POST", "/v2/messages/preview", body)})
+                     "preview": api.call("POST", "/v2/messages/preview", body), "project_source": context["project_source"]})
     key = str(uuid.uuid4())  # one Idempotency-Key per invocation: a retry never sends twice
-    if "session" not in body and os.environ.get("KABU_AUTO_SESSION") == "1":
-        auto_session(api, body, key)
+    if "session" not in body and (gone or os.environ.get("KABU_AUTO_SESSION") == "1"):
+        auto_session(api, body, key, session_key(harness()) if gone else "")  # a gone session's stand-in: this session's
     if files:
         body["attachments"] = [{"media": api.upload(f, f"{key}-file-{i}")} for i, f in enumerate(files, 1)]
     msg = api.call("POST", "/v2/messages", body, wait=WAIT if cmd == "ask" and not a["no_wait"] else 0, idem=key)
+    if body.get("session") and msg.get("session", body["session"]) is None:  # the API dropped it: deleted with its project
+        gone = body["session"]
+        path, known = gone_sessions(api.base)
+        write_cache(path, "\n".join([*known, gone][-100:]) + "\n")  # the last 100
+    context.update(session=msg.get("session"), **({"session_gone": gone} if gone else {}))
     if cmd == "send" or a["no_wait"]:
         done: JSON = {"attachments": len(files)} if cmd == "send" else {"outcome": "pending"}
-        return emit({"ok": True, "id": msg.get("id"), "status": msg.get("status"), **done})
+        return emit({"ok": True, "id": msg.get("id"), "status": msg.get("status"), **done, **context})
     mid, deadline = str(msg.get("id")), time.monotonic() + body["expires_in"] + GRACE  # the API settles an ask at expiry
     hint = f"The ask is still open, so never ask it again; wait for its answer with: kabu status {mid} --wait 50"
     while msg.get("status") == "pending":
@@ -758,21 +908,27 @@ def cmd_message(cmd: str, a: JSON) -> int:
         try:
             msg = api.call("GET", "/v2/messages/" + urllib.parse.quote(mid, safe=""), wait=WAIT)
         except CliError as e:  # a network blip, 5xx or 429 only delays the wait; a refusal ends it
+            if e.extra.get("status") == 404:  # deleted, as with its project: no answer will ever come, so never wait on
+                raise CliError("ask_gone", f"{mid} was deleted (as when its project is), so it will never be answered.",
+                               "Ask again if you still need it.", EXIT_CANCELLED, {**e.extra, "id": mid}) from None
             if 400 <= e.extra.get("status", 0) < 500 and e.extra["status"] != 429:
                 raise CliError(e.code, e.message, hint, e.exit, {**e.extra, "id": mid}) from None
             time.sleep(5)
     summary, code = classify_ask_outcome(msg, body["ask"]["type"])
-    return emit(summary, code, sort=True)
+    return emit({**summary, **context}, code, sort=True)
 
 
-def auto_session(api: Api, body: JSON, key: str) -> None:
+def auto_session(api: Api, body: JSON, key: str, scope: str = "") -> None:
     """KABU_AUTO_SESSION=1: one session per host, project and agent groups their messages. One try of up to 3 s; an ended
-    or expired session (the API returns a run's session even then), or any failure, sends the message without one."""
-    host, project, agent = socket.gethostname().split(".")[0], body["project"], body["agent"]
+    or expired session (the API returns a run's session even then), or any failure, sends the message without one. With
+    no project in the message, the session names none either: the API picks it as for the message (a bound key's). A
+    `scope`, this agent session's key, makes it this session's own, as a gone session's stand-in is."""
+    host, project, agent = socket.gethostname().split(".")[0], body.get("project"), body["agent"]
+    tail = f":{scope}" if scope else ""
     try:
         session = Api(api.base, api.key, 3.0, 0).call("POST", "/v2/sessions", {
-            "title": f"{agent} on {host} · {project}"[:80], "project": project, "agent": agent,
-            "external_id": f"auto:{host}:{project}:{agent}"[:120]}, idem=f"{key}-session")
+            "title": f"{agent} on {host}{f' · {project}' if project else ''}"[:80], **({"project": project} if project else {}),
+            "agent": agent, "external_id": f"auto:{host}:{project or ''}:{agent}"[:120 - len(tail)] + tail}, idem=f"{key}-session")
     except CliError:
         return  # a session only groups messages: it never stops one
     if isinstance(session.get("id"), str) and session.get("status") not in ("ended", "expired") and not session.get("ended_at"):
@@ -785,13 +941,20 @@ def cmd_session(cmd: str, a: JSON) -> int:
     update = {k: body.pop(k) for k in ("headline", "progress") if k in body}  # what session update takes
     if action != "start":
         sid = the_id(cmd, a["id"], "ses_", "KABU_SESSION")
-        if action == "end":
-            return emit(Api.connect(a).call("POST", f"/v2/sessions/{sid}/end", body, idem=str(uuid.uuid4())))
-        if not update:
+        if action == "update" and not update:
             raise CliError("missing_flag", "Nothing to update.", "Example: kabu session update --headline 'Running tests' --progress 3/8")
-        return emit(Api.connect(a).call("PATCH", f"/v2/sessions/{sid}", update))
+        api, another = Api.connect(a), 'start another: kabu session start --title "…"'
+        if sid in gone_sessions(api.base)[1]:  # the API reported it gone, deleted with its project: no call can reach it
+            raise CliError("session_gone", f"{sid} no longer exists: it was deleted (as when its project is).",
+                           another.capitalize() + ".", EXIT_TRANSPORT, {"id": sid})
+        try:
+            return emit(api.call("POST", f"/v2/sessions/{sid}/end", body, idem=str(uuid.uuid4())) if action == "end"
+                        else api.call("PATCH", f"/v2/sessions/{sid}", update))
+        except CliError as e:
+            raise if_gone(e, another) from None
     if not a["title"]:
         raise CliError("missing_flag", "kabu session start needs --title.", 'Example: kabu session start --title "Fix flaky auth test"')
+    with_project(cmd, body)
     api = Api.connect(a)
     session = api.call("POST", "/v2/sessions", {**body, "live": {"enabled": True}}, idem=str(uuid.uuid4()))
     if session.get("status") == "ended":  # get-or-create found this --external-id's session, already over
@@ -804,7 +967,16 @@ def cmd_session(cmd: str, a: JSON) -> int:
 
 def cmd_status(cmd: str, a: JSON) -> int:
     check(cmd, STATUS, a)
-    return emit(Api.connect(a).call("GET", "/v2/messages/" + the_id(cmd, a["id"], "msg_"), wait=a["wait"] or 0))
+    try:
+        return emit(Api.connect(a).call("GET", "/v2/messages/" + the_id(cmd, a["id"], "msg_"), wait=a["wait"] or 0))
+    except CliError as e:
+        raise if_gone(e, "it will never be answered, so do not wait on it; ask again if you still need it") from None
+
+
+def if_gone(e: CliError, then: str) -> CliError:
+    """The API's 404 for a message or session, with a hint that says what it means; any other error as it is."""
+    return CliError(e.code, e.message, f"It was deleted (as when its project is) or never existed: {then}.", e.exit,
+                    e.extra) if e.extra.get("status") == 404 else e
 
 
 def cmd_whoami(cmd: str, a: JSON) -> int:
@@ -815,14 +987,19 @@ def cmd_whoami(cmd: str, a: JSON) -> int:
         org: Optional[JSON] = api.call("GET", "/v2/org")
     except CliError:
         org = None  # GET /v2/org needs org:write, which agent keys lack; GET /v2/me takes only a signed-in human
+    project, source = resolve_project()
     return emit({"ok": True, "capabilities": capabilities, "org": org, "org_name": (org or {}).get("name") or load_config().get("org_name"),
-                 "project": detect_project(), "agent": resolve_agent(), "base_url": api.base, "config_path": str(default_config_path())})
+                 "project": project, "project_source": source, "agent": resolve_agent(), "base_url": api.base,
+                 "config_path": str(default_config_path())})
 
 
 def device_login(api: Api, name: str) -> JSON:
     """RFC 8628: print a code for a person to approve in Kabu, then poll for this computer's own key."""
     auth = api.call("POST", "/v2/device_authorizations", {"name": name})
-    print(f"Open {auth.get('verification_uri_complete')} and approve code {auth.get('user_code')} in Kabu.", file=sys.stderr, flush=True)
+    link = auth.get("verification_uri_complete") or auth.get("verification_uri")
+    print(f"In the Kabu app, open Connect a computer and enter the code: {auth.get('user_code')}"
+          + (f"\nOr approve it in a browser: {link}" if link else "") + "\nOnly an admin or owner of the workspace can approve it.",
+          file=sys.stderr, flush=True)
     form = {"device_code": str(auth.get("device_code", "")), "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}
     interval, deadline = float(auth.get("interval", 5)), time.monotonic() + float(auth.get("expires_in", 600))
     while time.monotonic() < deadline:
@@ -863,6 +1040,13 @@ def cmd_login(cmd: str, a: JSON) -> int:
     return emit({"ok": True, **known, "config_path": str(save_config(cfg))})
 
 
+def tool_project() -> Optional[str]:
+    """The project kabu mcp adds to a tool call, resolved for that call as kabu send would: one rules 1 to 5 name (the
+    environment, the session, the folder, the login), never a <folder>@<host> name, nor none."""
+    project, source = resolve_project()
+    return project if source["rule"] not in ("folder", "default") else None
+
+
 def cmd_mcp(cmd: str, a: JSON) -> int:
     """Bridge a harness's stdio MCP to the API's /mcp with the saved key (CONTRACT.md, MCP bridge). Logs go to stderr."""
     import threading
@@ -871,6 +1055,11 @@ def cmd_mcp(cmd: str, a: JSON) -> int:
     api = Api.connect(a)
     url, out = api.base + "/mcp", threading.Lock()
     session: Dict[str, str] = {}  # the Mcp-Session-Id the server issued, sent on every later request
+    takes: Set[str] = set()  # the tools whose input has a project, from tools/list
+    try:  # a key bound to a project sends as it, and another project would be refused (403): then add none
+        bound = bool(Api(api.base, api.key, 3.0, 0).call("GET", "/v2").get("project"))
+    except CliError:
+        bound = True  # not known: add none, as before 2.4.0
 
     def write(reply: Any) -> None:
         with out:
@@ -908,6 +1097,11 @@ def cmd_mcp(cmd: str, a: JSON) -> int:
 
         def show(reply: Any) -> None:
             nonlocal answered
+            if isinstance(msg, dict) and msg.get("method") == "tools/list":
+                try:
+                    takes.update(t["name"] for t in reply["result"]["tools"] if "project" in t["inputSchema"]["properties"])
+                except (KeyError, TypeError):
+                    pass  # a list without schemas: no tool gets a project
             write(reply)
             answered = answered or isinstance(reply, dict) and "method" not in reply and reply.get("id") == rid
 
@@ -935,6 +1129,14 @@ def cmd_mcp(cmd: str, a: JSON) -> int:
             msg = json.loads(line)
         except ValueError:
             msg = None  # sent as it is: the server answers with a parse error
+        call = msg.get("params") if isinstance(msg, dict) and msg.get("method") == "tools/call" else None
+        call = call if isinstance(call, dict) else {}
+        tool = call.get("name")  # a str, unless the harness sent something odd
+        args = call.setdefault("arguments", {}) if isinstance(tool, str) and tool in takes and not bound else None
+        project = tool_project() if isinstance(args, dict) and not args.get("project") else None
+        if project and isinstance(args, dict):
+            args["project"] = project
+            line = json.dumps(msg).encode()
         if isinstance(msg, dict) and "method" in msg and "id" in msg:  # a request runs alongside the others
             pending = [t for t in pending if t.is_alive()] + [threading.Thread(target=forward, args=(line, msg), daemon=True)]
             pending[-1].start()
@@ -959,14 +1161,15 @@ COMMANDS = {
   kabu send "Tests passed" "412 passed, 0 failed" --file report.png --link "PR=https://github.com/o/r/pull/7"
   kabu send "Nightly report" - < report.md
   git diff | kabu send "Review this" --diff - --diff-path src/app.py""", MESSAGE, TEXT_ARG),
-    "ask": Command(cmd_message, "Ask a human and wait. Exit 0 approved or a choice or text given; 10 rejected; 20 expired; 21 cancelled.", """\
+    "ask": Command(cmd_message, "Ask a human and wait. Exit 0 approved or a choice or text given; 10 rejected; 20 expired; "
+                   "21 cancelled or deleted.", """\
   kabu ask "Deploy to prod?"                  approve (exit 0) or reject (exit 10)
   kabu ask "Which env?" -c staging -c prod    a choice: exit 0 whatever is chosen, so branch on .option
   kabu ask "Release name?" --type text        the answer's text is what they typed
   kabu ask "Run it?" --action db.migrate --args '{"version": 42}' --irreversible""", MESSAGE, TEXT_ARG),
     "status": Command(cmd_status, "Print a message as the API has it; exit 0 whatever the answer, so read .resolution.decision.", """\
   kabu status msg_01J9Z --wait 50     hold up to 50 s while an ask is pending""", STATUS, ("id", "?", "a msg_… id")),
-    "whoami": Command(cmd_whoami, "Print what the key can do (GET /v2), its org, and the project and agent kabu would send.", """\
+    "whoami": Command(cmd_whoami, "Print what the key can do, its org, and the project (and why) and agent kabu would send.", """\
   kabu whoami""", CONNECTION),
     "session start": Command(cmd_session, "Get or create a running session with a Live Activity. Prints the session.", """\
   export KABU_SESSION=$(kabu session start --title "Fix flaky auth test" | jq -r .id)
@@ -978,7 +1181,7 @@ COMMANDS = {
   kabu session end --outcome success --summary "PR opened"
   kabu session end ses_01J9Z --outcome failure --dismiss-after 0""", SESSION_END, SESSION_ID),
     "login": Command(cmd_login, "Save a key and defaults to the config file (mode 600). Exit 10: code denied; 20: expired.", """\
-  kabu login --device                   prints a code to approve in Kabu, then saves this computer's key
+  kabu login --device                   prints a code to enter in the Kabu app, then saves this computer's key
   kabu login --api-key - < key.txt      no prompt; with no flag at a terminal, kabu asks for the key""", LOGIN),
     "mcp": Command(cmd_mcp, "Serve Kabu's MCP tools on stdin and stdout for a harness that starts it, through the API's /mcp "
                    "and the saved key. Exit 0 when stdin closes.", """\

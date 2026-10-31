@@ -1,6 +1,6 @@
 ---
 name: kabu-notify
-description: Notify and ask the user on their phone through Kabu. Use when the user wants to be told or asked on their phone (notify me, ping me, ask me before you...), when long work finishes, fails or is blocked while they may be away, before an irreversible or production action that needs their approval, when they must pick an option or type an answer, and to show a long run's progress on their Lock Screen. Runs the kabu CLI that ships with this plugin.
+description: Notify and ask the user on their phone through Kabu. Use when the user wants to be told or asked on their phone (notify me, ping me, ask me before you...), when long work finishes, fails or is blocked while they may be away, before an irreversible or production action that needs their approval, when they must pick an option or type an answer, and to show a long run's session progress. Runs the kabu CLI that ships with this plugin.
 allowed-tools: Bash(kabu:*)
 ---
 
@@ -20,7 +20,9 @@ The CLI ships with this plugin, in its `bin/` folder.
 
 Each command prints one JSON object on stdout; an error is one JSON line on stderr with a `hint`, which is the fix.
 On `missing_api_key`, connect this computer yourself: start `kabu login --device` as a background command (it waits up
-to 10 minutes), show the user the link and code it prints on stderr, and carry on once they approve it in the Kabu app.
+to 10 minutes), show the user what it prints on stderr (the code to enter in the Kabu app under Connect a computer,
+or a link that approves it in a browser; an admin or owner of the workspace must approve it), and carry on once they
+have.
 If the `kabu` MCP server had failed for want of a key, ask them to reconnect it in `/mcp`. Never ask for, print or pass
 an API key yourself.
 
@@ -42,7 +44,8 @@ git diff --stat | kabu send "Ready for review" -
 ```
 
 `-` as the message reads it from stdin; `--diff -`, `--code -` and `--quote -` read a block from stdin instead.
-It prints `{"ok": true, "id": "msg_…", "status": "sent", "attachments": 0}`.
+It prints `{"ok": true, "id": "msg_…", "status": "sent", "attachments": 0, "project": "…", "project_source": {…},
+"session": null}`.
 
 ## Ask
 
@@ -64,9 +67,10 @@ either end (`-c "Roll back"` gives `roll_back`, `-c "Ship it."` gives `ship_it`)
 accents, set your own id: `-c "eu:Prod (EU)"` answers `eu`.
 
 Exit codes: `0` approved, or a choice or text answered; `10` rejected, or a typed reply to an approve-or-reject ask
-(read `text`); `20` expired with no answer; `21` cancelled; `2` bad command, nothing sent (fix it from the hint); `3`
-network or API error, or an answer kabu does not know. Only `0` is a go: on any other code, do not act. A `3` error
-with an `id` means the ask is still open: run its hint, `kabu status ID --wait 50`, and never ask again.
+(read `text`); `20` expired with no answer; `21` cancelled, or `ask_gone`: deleted with its project, so ask again only
+if you still need the answer; `2` bad command, nothing sent (fix it from the hint); `3` network or API error, or an
+answer kabu does not know. Only `0` is a go: on any other code, do not act. A `3` error with an `id` means the ask is
+still open: run its hint, `kabu status ID --wait 50`, and never ask again.
 
 To wait longer than one tool call allows: `kabu ask "…" --no-wait --expires-in 3600` prints the `id` (`msg_…`). Then
 run `kabu status msg_… --wait 50` until `status` is no longer `pending`. It exits 0 whatever the answer, so read it:
@@ -74,7 +78,7 @@ when `status` is `answered`, an approve-or-reject ask is a go only if `resolutio
 a typed answer is in `resolution.option`, `resolution.options` or `resolution.text`. `expired` and `cancelled` mean no
 answer.
 
-## Show progress on the Lock Screen
+## Show session progress
 
 ```bash
 kabu session start --title "Migrate billing to v2" --headline "Copying tables" --progress 0/4
@@ -89,16 +93,21 @@ kabu send "Tables copied" "4 of 4 verified" --session ses_…
 kabu session end ses_… --outcome success --summary "PR #12 opened"
 ```
 
-`--outcome` is `success`, `failure` or `cancelled`. Messages sent with `--session` group under it in the app.
+`--outcome` is `success`, `failure` or `cancelled`. Messages sent with `--session` group under it in the app. If a
+send prints `session_gone`, that session was deleted with its project: kabu leaves the id out from then on and puts
+later messages in a fresh session, whose id each output gives in `session`.
 
 ## Check first
 
-- `kabu whoami`: what the key may do, and the project and agent kabu sends as (from git and the harness running it).
+- `kabu whoami`: what the key may do, and the project and agent kabu sends as. The project is the one the folder
+  your session started in names, wherever you run kabu, and a scratch folder in `/tmp` never names one;
+  `project_source` says why. Pass `--project`, or set `KABU_PROJECT`, only to send somewhere else.
 - `--dry-run` on `send` or `ask`: the API checks it and shows the push; nothing is sent.
 - `kabu COMMAND --help`: every option and its limit.
 
 ## MCP tools
 
 The plugin also runs the `kabu` MCP server (`kabu mcp`, with the same login): `notify_human`, `ask_human`,
-`wait_for_human_answer` and `upload_file_for_human`. Use the CLI or the tools for a message, not both; with the
-tools, pass `project` and `agent` yourself.
+`wait_for_human_answer` and `upload_file_for_human`. Use the CLI or the tools for a message, not both. For the tools
+that take a project, `kabu mcp` fills in the one your session's folders name, at each call, unless your key is bound
+to a project; the server names the agent after your client. Pass either only to override it.

@@ -38,7 +38,7 @@ def command(event: str, payload: Dict[str, Any], cwd: Path) -> Tuple[List[str], 
     Code's Stop carries the last message, of which only an excerpt is sent; a Notification has its own text.
 
     The project and agent are resolved here, while this hook's parent is still the harness: the background send
-    outlives it."""
+    outlives it. The event's folder stands in for the current one, as a client may run hooks in the plugin's."""
     title, message = DEFAULTS[event]
     if event == "input":
         title = str(payload.get("title") or title).strip()[:120]
@@ -46,7 +46,8 @@ def command(event: str, payload: Dict[str, Any], cwd: Path) -> Tuple[List[str], 
     if len(text) > EXCERPT:
         text = text[:EXCERPT - 1].rstrip() + "…"
     kabu = load_kabu()
-    return [sys.executable, str(KABU), "send", f"--title={title}", "-", f"--project={kabu.detect_project(cwd)}",
+    project = kabu.resolve_project(cwd)[0]
+    return [sys.executable, str(KABU), "send", f"--title={title}", "-", *([f"--project={project}"] if project else []),
             f"--agent={kabu.resolve_agent()}"], text
 
 
