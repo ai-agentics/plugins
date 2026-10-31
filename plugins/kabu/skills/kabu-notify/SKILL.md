@@ -111,3 +111,5 @@ The plugin also runs the `kabu` MCP server (`kabu mcp`, with the same login): `n
 `wait_for_human_answer` and `upload_file_for_human`. Use the CLI or the tools for a message, not both. For the tools
 that take a project, `kabu mcp` fills in the one your session's folders name, at each call, unless your key is bound
 to a project; the server names the agent after your client. Pass either only to override it.
+`ask_human` and `wait_for_human_answer` wait 25 s; to wait until the human replies, pass `max_wait_seconds: 3600`.
+If either still returns an `id`, call `wait_for_human_answer` with it again.
