@@ -45,7 +45,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -919,16 +919,18 @@ def cmd_message(cmd: str, a: JSON) -> int:
 
 
 def auto_session(api: Api, body: JSON, key: str, scope: str = "") -> None:
-    """KABU_AUTO_SESSION=1: one session per host, project and agent groups their messages. One try of up to 3 s; an ended
-    or expired session (the API returns a run's session even then), or any failure, sends the message without one. With
-    no project in the message, the session names none either: the API picks it as for the message (a bound key's). A
-    `scope`, this agent session's key, makes it this session's own, as a gone session's stand-in is."""
+    """KABU_AUTO_SESSION=1: one session per host, project and agent groups their messages and shows on the Lock Screen
+    (a Live Activity; each ask in it has its own). One try of up to 3 s; an ended or expired session (the API returns a
+    run's session even then), or any failure, sends the message without one. With no project in the message, the session
+    names none either: the API picks it as for the message (a bound key's). A `scope`, this agent session's key, makes it
+    this session's own, as a gone session's stand-in is."""
     host, project, agent = socket.gethostname().split(".")[0], body.get("project"), body["agent"]
     tail = f":{scope}" if scope else ""
     try:
         session = Api(api.base, api.key, 3.0, 0).call("POST", "/v2/sessions", {
             "title": f"{agent} on {host}{f' · {project}' if project else ''}"[:80], **({"project": project} if project else {}),
-            "agent": agent, "external_id": f"auto:{host}:{project or ''}:{agent}"[:120 - len(tail)] + tail}, idem=f"{key}-session")
+            "agent": agent, "external_id": f"auto:{host}:{project or ''}:{agent}"[:120 - len(tail)] + tail,
+            "live": {"enabled": True}}, idem=f"{key}-session")
     except CliError:
         return  # a session only groups messages: it never stops one
     if isinstance(session.get("id"), str) and session.get("status") not in ("ended", "expired") and not session.get("ended_at"):
