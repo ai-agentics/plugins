@@ -45,7 +45,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -891,7 +891,7 @@ def cmd_message(cmd: str, a: JSON) -> int:
         auto_session(api, body, key, session_key(harness()) if gone else "")  # a gone session's stand-in: this session's
     if files:
         body["attachments"] = [{"media": api.upload(f, f"{key}-file-{i}")} for i, f in enumerate(files, 1)]
-    msg = api.call("POST", "/v2/messages", body, wait=WAIT if cmd == "ask" and not a["no_wait"] else 0, idem=key)
+    msg = api.call("POST", "/v2/messages", body, idem=key)  # an ask waits below, by its id: a 404 there is ask_gone
     if body.get("session") and msg.get("session", body["session"]) is None:  # the API dropped it: deleted with its project
         gone = body["session"]
         path, known = gone_sessions(api.base)
