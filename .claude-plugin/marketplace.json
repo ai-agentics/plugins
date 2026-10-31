@@ -11,8 +11,8 @@
     {
       "name": "kabu",
       "source": "./plugins/kabu",
-      "description": "Reach yourself on your phone from your coding agent: notifications, approvals, choices and typed replies, Live Activity progress, and Kabu's MCP tools.",
-      "version": "2.2.0",
+      "description": "Reach yourself on your phone from your coding agent: notifications, approvals, choices and typed replies, session progress, and Kabu's MCP tools.",
+      "version": "2.4.0",
       "author": {
         "name": "NexAI Tech",
         "url": "https://usekabu.com"

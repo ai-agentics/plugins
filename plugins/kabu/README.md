@@ -1,8 +1,8 @@
 # Kabu for Claude Code and GitHub Copilot CLI
 
 [Kabu](https://usekabu.com) puts your coding agent on your phone. The agent tells you when work finishes or fails,
-asks before risky steps, lets you pick an option or type an answer from the Lock Screen, and shows a long run's
-progress as a Live Activity. You need the Kabu app on your iPhone and Python 3.9 or later as `python3`.
+asks before risky steps, lets you pick an option or type an answer from the Lock Screen, and reports a long run's
+session progress. You need the Kabu app on your iPhone and Python 3.9 or later as `python3`.
 
 | Part | What it does |
 |---|---|
@@ -31,7 +31,8 @@ Then log in, below, and restart the session, so the skill, the MCP server and th
 
 ## Log in
 
-Connect this computer once. Approve the code it prints in the Kabu app; its own key is then saved to
+Connect this computer once. In the Kabu app, open Connect a computer and enter the code it prints (or open the link
+it prints in a browser); an admin or owner of the workspace must approve it. Its own key is then saved to
 `~/.config/kabu/config.json` (mode 600), and the skill, the MCP server and the hooks all use it. No key goes in any
 plugin or agent config.
 
@@ -48,7 +49,7 @@ shows you the code. Claude Code puts the plugin's `bin/` on the PATH of the agen
 | Claude Code | `~/.claude/plugins/cache/ai-agentics/kabu/<version>/bin/kabu` |
 | Copilot CLI | `~/.copilot/installed-plugins/ai-agentics/kabu/bin/kabu` |
 
-Or install it on your PATH: `curl -fsSL https://usekabu.com/kabu -o ~/.local/bin/kabu && chmod +x ~/.local/bin/kabu`.
+Or install it on your PATH: `mkdir -p ~/.local/bin && curl -fsSL https://usekabu.com/kabu -o ~/.local/bin/kabu && chmod +x ~/.local/bin/kabu`.
 Check the login with `kabu whoami`.
 
 ## Use it
@@ -69,7 +70,9 @@ Every command prints JSON; `kabu --help` and `kabu COMMAND --help` list the opti
 
 The plugin starts an MCP server named `kabu` as `python3 bin/kabu mcp`. It relays MCP over stdio to
 `https://usekabu.com/mcp` (or `KABU_BASE_URL`) with your saved key, so the agent also gets the tools `notify_human`,
-`ask_human`, `wait_for_human_answer` and `upload_file_for_human`. Check it with `/mcp` in Claude Code or Copilot CLI.
+`ask_human`, `wait_for_human_answer` and `upload_file_for_human`. For the tools that take a project it fills in the
+one your session's folders name, at each call, unless your key is bound to a project. Check it with `/mcp` in Claude
+Code or Copilot CLI.
 It reads the login saved by `kabu login --device`, which works in both clients. Settings such as `KABU_API_KEY` and
 `KABU_BASE_URL` reach it only if the client passes your shell's environment on to its MCP servers, so prefer the
 saved login.
@@ -97,6 +100,7 @@ They need a POSIX shell (macOS or Linux). If you already use Kabu's older hooks 
 | `kabu: command not found` | Use the plugin's copy, as in Log in, or `python3 <plugin>/bin/kabu` |
 | MCP server failed, or `HTTP 401` from a tool | Log in again: the key is missing or revoked (`kabu whoami` shows which is in use). Then reconnect `kabu` in `/mcp`, or restart |
 | No push arrives | `kabu send "Test" --dry-run` shows what would be sent; check the app is signed in to the same account |
+| Messages land in another project | The project is the one of the folder the agent session started in, whatever folder a command runs in; `kabu whoami` shows it and, in `project_source`, why. Set `KABU_PROJECT` to choose another |
 | An ask returns exit 20 | It expired unanswered; raise `--expires-in` (default 300 seconds) |
 | No hook pushes | Set `KABU_HOOKS=1` before starting the agent, then restart it |
 
