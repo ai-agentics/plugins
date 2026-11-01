@@ -14,7 +14,8 @@ Commands:
 
 Presence (on by default; KABU_PRESENCE=0 or kabu presence off turns it off): kabu presence status shows whether your
 agents are live, as their hooks wrote it on this machine and one kabu presence run reports it; kabu presence install
---harness claude|copilot adds the hook to a harness's settings (the Kabu plugin has it), and uninstall takes it out.
+--harness claude|copilot|codex|gemini|cursor|pi adds the hook (pi: an extension) to a harness's settings (the Kabu
+plugin has it for Claude Code and Copilot CLI), and uninstall takes it out; kabu presence herdr on adds Herdr's view.
 
 Output is one JSON object on stdout. An error is one JSON line on stderr, {"error": {"code", "message", "hint"}};
 the hint is the next step, usually a corrected command. Nothing is ever coloured.
@@ -42,6 +43,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -54,7 +56,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.5.1"
+VERSION = "2.6.0"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -673,10 +675,11 @@ LOGIN = (
     Opt(("--agent", "-a"), "default agent to save, max 64", "claude-code", limit=64),
 )
 PRESENCE_SETTINGS = (
-    Opt(("--harness",), "the harness whose settings get the hook: claude (Claude Code) or copilot (Copilot CLI)", "claude",
-        choices=("claude", "copilot")),
+    Opt(("--harness",), "the harness whose settings get the hook: claude (Claude Code), copilot (Copilot CLI), codex, gemini "
+        "(Gemini CLI), cursor (Cursor and its CLI) or pi (an extension)", "claude", choices=("claude", "copilot", "codex", "gemini", "cursor", "pi")),
     Opt(("--settings",), "its settings file (default: CLAUDE_CONFIG_DIR's or ~/.claude's settings.json; COPILOT_HOME's or "
-        "~/.copilot's)", "~/.claude/settings.json", metavar="PATH"),
+        "~/.copilot's; CODEX_HOME's or ~/.codex's hooks.json; ~/.gemini/settings.json; ~/.cursor/hooks.json; "
+        "PI_CODING_AGENT_DIR's or ~/.pi/agent's extensions/kabu-presence.js)", "~/.claude/settings.json", metavar="PATH"),
 )
 ENV_HELP = "\n\nEnvironment: KABU_API_KEY, KABU_BASE_URL, KABU_PROJECT, KABU_AGENT, KABU_SESSION and more: kabu --help."
 SESSION_ID = ("id", "?", "a ses_… id (default: KABU_SESSION)")
@@ -1299,6 +1302,21 @@ PRESENCE_TORN = 10.0  # an empty or unreadable record this old is a hook stopped
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd")
 COPILOT_EVENTS = {"SessionStart": "sessionStart", "UserPromptSubmit": "userPromptSubmitted", "PreToolUse": "preToolUse",
                   "PostToolUse": "postToolUse", "Notification": "notification", "Stop": "agentStop", "SessionEnd": "sessionEnd"}
+# Each harness kabu presence install knows: its agent slug, its settings (the variable naming its folder, the folder
+# under the home, the file) and the hook events it gets, each in the harness's own name, from its current docs (pi has
+# an in-process extension instead: PI_EXTENSION). Cursor gets no preToolUse: a permission hook there blocks the tool
+# on an empty answer. The hook maps each name to a state (PRESENCE_HOOK's first case).
+HARNESS_SLUGS = {"claude": "claude-code", "copilot": "copilot-cli", "codex": "codex", "gemini": "gemini-cli", "cursor": "cursor",
+                 "pi": "pi"}
+HARNESS_FILES = {"claude": ("CLAUDE_CONFIG_DIR", ".claude", "settings.json"), "copilot": ("COPILOT_HOME", ".copilot", "settings.json"),
+                 "codex": ("CODEX_HOME", ".codex", "hooks.json"), "gemini": ("", ".gemini", "settings.json"),
+                 "cursor": ("", ".cursor", "hooks.json"), "pi": ("PI_CODING_AGENT_DIR", ".pi/agent", "extensions/kabu-presence.js")}
+HARNESS_EVENTS = {
+    "codex": ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "Interrupt", "SessionEnd"),
+    "gemini": ("SessionStart", "BeforeAgent", "BeforeTool", "AfterTool", "Notification", "AfterAgent", "SessionEnd"),
+    "cursor": ("sessionStart", "beforeSubmitPrompt", "postToolUse", "postToolUseFailure", "stop", "sessionEnd"),
+    "pi": ("session_start", "agent_start", "tool_call", "ui_prompt_start", "ui_prompt_end", "agent_settled", "session_shutdown"),
+}
 NEEDS_INPUT = "permission_prompt|elicitation_dialog|elicitation_url_dialog|worker_permission_prompt|agent_needs_input"
 HOOK_FILE = "presence-hook.sh"  # kabu presence install writes the hook here, in KABU_HOME, and knows its entries by it
 HOOK_CLI = 'kabu_cli="${CLAUDE_PLUGIN_ROOT:-.}/bin/kabu"'  # the plugin's; install puts this CLI's path in its place
@@ -1309,14 +1327,15 @@ RECORD = re.compile(r"l(\d+)-(\d+)\.json")  # a hook's record: the harness's pro
 # order. It never reads its input, which a harness may hold open: the session id is Claude Code's CLAUDE_CODE_SESSION_ID
 # (else the harness's process id and start time stand for it), and the Notification matcher picks the types that need
 # the user. scripts/plugin.py writes it to plugins/kabu/hooks/presence.sh.
-PRESENCE_HOOK = r"""# Kabu presence hook for Claude Code and Copilot CLI (ADR 021). Generated by kabu: do not edit.
-# Hook command: kabu_event=EVENT; (. THIS_FILE) || true   It starts no program but the reporter, never reads its
-# input (so it never waits for it), has no unbounded loop, and always exits 0.
+PRESENCE_HOOK = r"""# Kabu presence hook for Claude Code, Copilot CLI, Codex, Gemini CLI and Cursor (ADR 021). Generated by kabu:
+# do not edit. Hook command: kabu_event=EVENT [kabu_harness=SLUG]; (. THIS_FILE) || true   It starts no program but
+# the reporter, never reads its input (so it never waits for it), has no unbounded loop, and always exits 0.
 # Each event is a new 0600 record, created no-clobber in this user's machine-local folder (0700, never a link):
 # ${KABU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}/kabu-presence-$USER/l<harness pid>-<seq>.json: the state,
 # the harness's process and session ids and the Herdr pane. Never a prompt, path or tool name, never the network.
 # It starts `kabu presence run`, which reports, when none runs. Off: KABU_PRESENCE=0 or `kabu presence off`.
 kabu_cli="${CLAUDE_PLUGIN_ROOT:-.}/bin/kabu"
+[ -z "${ZSH_VERSION:-}" ] || emulate sh
 umask 077
 exec 2>/dev/null
 [ "${KABU_PRESENCE:-}" = 0 ] && exit 0
@@ -1324,14 +1343,15 @@ exec 2>/dev/null
 kabu_att=null
 case "${kabu_event:-}" in
   SessionStart|sessionStart) kabu_rt=idle kabu_ev=start ;;
-  UserPromptSubmit|userPromptSubmitted) kabu_rt=working kabu_ev=prompt ;;
-  PreToolUse|preToolUse) kabu_rt=working kabu_ev=tool ;;
-  PostToolUse|postToolUse) kabu_rt=working kabu_ev=post ;;
-  Notification|notification) kabu_rt=working kabu_ev=attention kabu_att='"terminal"' ;;
-  Stop|agentStop) kabu_rt=idle kabu_ev=stop ;;
+  UserPromptSubmit|userPromptSubmitted|BeforeAgent|beforeSubmitPrompt) kabu_rt=working kabu_ev=prompt ;;
+  PreToolUse|preToolUse|BeforeTool) kabu_rt=working kabu_ev=tool ;;
+  PostToolUse|postToolUse|AfterTool|postToolUseFailure) kabu_rt=working kabu_ev=post ;;
+  Notification|notification|PermissionRequest) kabu_rt=working kabu_ev=attention kabu_att='"terminal"' ;;
+  Stop|agentStop|AfterAgent|Interrupt|stop) kabu_rt=idle kabu_ev=stop ;;
   SessionEnd|sessionEnd) kabu_rt=offline kabu_ev=end ;;
   *) exit 0 ;;
 esac
+case "${kabu_harness:-}" in codex|gemini-cli|cursor) ;; *) kabu_harness= ;; esac
 kabu_dir=${KABU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}
 kabu_dir="${kabu_dir%/}/kabu-presence-${USER:-${LOGNAME:-}}"
 [ -L "$kabu_dir" ] && exit 0
@@ -1339,6 +1359,7 @@ kabu_dir="${kabu_dir%/}/kabu-presence-${USER:-${LOGNAME:-}}"
 [ -O "$kabu_dir" ] && [ ! -L "$kabu_dir" ] || exit 0
 kabu_sid=
 [ "${CLAUDE_PID:-}" = "$PPID" ] && kabu_sid=${CLAUDE_CODE_SESSION_ID:-}
+[ "$kabu_harness" = gemini-cli ] && kabu_sid=${GEMINI_SESSION_ID:-}
 kabu_pane=${HERDR_PANE_ID:-}
 case $kabu_pane in *[!A-Za-z0-9._:-]*) kabu_pane= ;; esac
 [ ${#kabu_pane} -le 40 ] || kabu_pane=
@@ -1359,7 +1380,7 @@ kabu_put() {
     kabu_seq=$((kabu_seq + 1))
     kabu_f="$kabu_dir/l$PPID-$kabu_seq.json"
     { [ -e "$kabu_f" ] || [ -L "$kabu_f" ]; } && continue
-    printf '%s\n' "{\"v\":2,\"event\":\"$kabu_ev\",\"runtime\":\"$kabu_rt\",\"attention\":$kabu_att,\"seq\":$kabu_seq,\"pid\":$PPID,\"sid\":\"$kabu_sid\",\"pane\":\"$kabu_pane\"}" > "$kabu_f" && return 0
+    printf '%s\n' "{\"v\":2,\"event\":\"$kabu_ev\",\"runtime\":\"$kabu_rt\",\"attention\":$kabu_att,\"seq\":$kabu_seq,\"pid\":$PPID,\"sid\":\"$kabu_sid\",\"pane\":\"$kabu_pane\",\"harness\":\"$kabu_harness\"}" > "$kabu_f" && return 0
   done
 }
 kabu_put
@@ -1371,6 +1392,113 @@ if [ "$kabu_ev" = start ] || [ "$kabu_run" -le 1 ] || ! kill -0 "$kabu_run"; the
   (python3 "$kabu_cli" presence run </dev/null >/dev/null 2>&1 &)
 fi
 exit 0
+"""
+# pi's presence (kabu presence install --harness pi): an extension pi loads in its own process, so it needs no hook.
+# Each event is a record written as the hook writes one (a new 0600 file, created no-clobber, never through a link, in
+# the same folder), with pi's own process id and, as its session id, the session file Herdr names it by (else pi's
+# session id). Every handler catches all and returns nothing: a tool_call handler that threw would block the tool.
+PI_EXTENSION = r"""// Kabu presence for pi (ADR 021). Generated by kabu presence install --harness pi: do not edit.
+// On each event it writes one 0600 record, no-clobber, in this user's machine-local folder (0700, never a link):
+// the state, pi's process and session ids and the Herdr pane. Never a prompt, path or tool name, never the network.
+// It never throws into pi and never blocks a tool. It starts `kabu presence run`, which reports, when none runs.
+// Off: KABU_PRESENCE=0 or `kabu presence off`.
+import fs from "node:fs";
+import os from "node:os";
+import { spawn } from "node:child_process";
+
+const KABU_CLI = "";
+const C = fs.constants;
+let running = false;
+
+function folder() {
+  const env = process.env;
+  if (env.KABU_PRESENCE === "0") return null;
+  try {
+    fs.lstatSync((env.KABU_HOME || os.homedir() + "/.kabu") + "/presence/off");
+    return null;
+  } catch (e) {}
+  const base = (env.KABU_RUNTIME_DIR || env.XDG_RUNTIME_DIR || env.TMPDIR || "/tmp").replace(/\/$/, "");
+  const dir = base + "/kabu-presence-" + (env.USER || env.LOGNAME || "");
+  try { fs.mkdirSync(dir, 0o700); } catch (e) {}
+  const st = fs.lstatSync(dir);
+  if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid()) return null;
+  if (st.mode & 0o077) fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
+function sessionId(ctx) {
+  let sid = "";
+  try {
+    const file = ctx && ctx.sessionManager && ctx.sessionManager.getSessionFile();
+    sid = typeof file === "string" && file.startsWith("/") ? file : String(ctx.sessionManager.getSessionId() || "");
+  } catch (e) {}
+  return sid.length <= 4096 && !/[\u0000-\u001f\u007f]/.test(sid) ? sid : "";
+}
+
+function put(dir, ev, runtime, attention, ctx) {
+  const pid = process.pid;
+  let max = 0, n = 0;
+  for (const name of fs.readdirSync(dir)) {
+    const m = /^l(\d+)-(\d+)\.json$/.exec(name);
+    if (m && Number(m[1]) === pid) { n += 1; max = Math.max(max, Number(m[2])); }
+  }
+  if (n >= 200) return;
+  const pane = /^[A-Za-z0-9._:-]{1,40}$/.test(process.env.HERDR_PANE_ID || "") ? process.env.HERDR_PANE_ID : "";
+  for (let seq = max + 1; seq <= max + 32; seq += 1) {
+    let fd;
+    try {
+      fd = fs.openSync(dir + "/l" + pid + "-" + seq + ".json", C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
+    } catch (e) {
+      if (e && e.code === "EEXIST") continue;
+      return;
+    }
+    try {
+      fs.writeSync(fd, JSON.stringify({ v: 2, event: ev, runtime, attention, seq, pid, sid: sessionId(ctx), pane, harness: "pi" }) + "\n");
+    } finally {
+      fs.closeSync(fd);
+    }
+    return;
+  }
+}
+
+function reporter(dir) {
+  let pid = 0;
+  try {
+    const fd = fs.openSync(dir + "/run.pid", C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+    try {
+      if (fs.fstatSync(fd).isFile()) pid = parseInt(fs.readFileSync(fd, "utf8").trim(), 10) || 0;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {}
+  if (pid > 1) {
+    try { process.kill(pid, 0); return; } catch (e) { if (e && e.code === "EPERM") return; }
+  }
+  const child = spawn("python3", [KABU_CLI, "presence", "run"], { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
+}
+
+function record(ev, runtime, attention, ctx) {
+  try {
+    const dir = folder();
+    if (dir === null) return;
+    put(dir, ev, runtime, attention, ctx);
+    if (ev !== "tool") reporter(dir);
+  } catch (e) {}
+}
+
+export default function (pi) {
+  pi.on("session_start", (event, ctx) => { running = false; record("start", "idle", null, ctx); });
+  pi.on("agent_start", (event, ctx) => { running = true; record("prompt", "working", null, ctx); });
+  pi.on("tool_call", (event, ctx) => { record("tool", "working", null, ctx); });
+  pi.on("ui_prompt_start", (event, ctx) => { record("attention", "working", "terminal", ctx); });
+  pi.on("ui_prompt_end", (event, ctx) => { record(running ? "post" : "stop", running ? "working" : "idle", null, ctx); });
+  pi.on("agent_settled", (event, ctx) => { running = false; record("stop", "idle", null, ctx); });
+  pi.on("session_shutdown", (event, ctx) => {
+    if (!event || event.reason !== "reload") record("end", "offline", null, ctx);
+  });
+}
 """
 
 
@@ -1599,17 +1727,21 @@ def fold(folder: Path, pid: Optional[int] = None, now: Optional[float] = None) -
             continue
         rec = dict(top[2] or {})
         rec["sid"] = next((str(i[2]["sid"]) for i in reversed(valid) if i[2] and i[2].get("sid")), "")
+        rec["harness"] = next((str(i[2]["harness"]) for i in reversed(valid) if i[2] and i[2].get("harness")), "")
         out[lane] = Folded(rec, top[3], [i[1] for i in items], [last[-1][1] for last in (hooks, mcp) if last])
     return out
 
 
 def record(path: Path, pid: int) -> Optional[JSON]:
     """One record, a hook's or kabu mcp's (source mcp: online, then offline at its EOF), or None while it is being
-    written or when it is not one."""
+    written or when it is not one. Its harness, when it names one, is one kabu knows; its session id is local only."""
     rec = read_json(path)
+    sid = rec.get("sid", "")
     ok = rec.get("pid") == pid and isinstance(rec.get("seq"), int) and rec.get("attention") in (None, "terminal") \
-        and isinstance(rec.get("sid", ""), str) and (rec.get("runtime") in ("working", "idle", "offline") and rec.get("source", "hook") == "hook"
-                                                     or rec.get("runtime") in ("online", "offline") and rec.get("source") == "mcp")
+        and isinstance(sid, str) and len(sid) <= 4096 and not re.search(r"[\x00-\x1f\x7f]", sid) \
+        and rec.get("harness", "") in ("", *HARNESS_SLUGS.values()) \
+        and (rec.get("runtime") in ("working", "idle", "offline") and rec.get("source", "hook") == "hook"
+             or rec.get("runtime") in ("online", "offline") and rec.get("source") == "mcp")
     return rec if ok else None
 
 
@@ -1667,7 +1799,7 @@ def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start
     title is constant ('<harness> session'), and its project the one the harness's folder names, as kabu send's. The
     reporter and a kabu send in that agent session so find the same one. None when the API cannot say."""
     native = str(rec.get("sid") or "") or f"pid:{rec['pid']}:{start}"
-    slug, path = harness_slug(name), folder / f"{lane}.session.json"
+    slug, path = str(rec.get("harness") or "") or harness_slug(name), folder / f"{lane}.session.json"
     base = keyed(inst, "session", slug, native)[:40]
     kept = read_json(path)
     turn = int(kept.get("round") or 0) if kept.get("id") == base else 0  # a session that ended: the next one
@@ -1736,6 +1868,81 @@ class Lane:
     want: Optional[Tuple[str, Optional[str]]] = None  # what it should read, since `since`
     since: float = 0.0
     gone: float = 0.0  # when its harness exited or its session ended: offline once, then it is forgotten
+    source: str = "hook"  # where what it reads comes from: its records' source, or herdr when Herdr's answer is used
+
+
+# The optional Herdr bridge (kabu presence herdr on; ADR 021): Herdr's own view of each agent, from `herdr agent list`
+# (never its socket), joined to a lane only by the exact session id Herdr names (agent_session.value), reading only
+# agent_status, through this one table; a status it lacks says nothing. Herdr's answer beats the hooks' working and idle;
+# a session that ended, an exited harness and the API's own facts (an ask, the end) beat Herdr.
+HERDR_STATES: Dict[str, Tuple[str, Optional[str]]] = {"working": ("working", None), "blocked": ("working", "terminal"),
+                                                      "idle": ("idle", None), "done": ("idle", None)}
+HERDR_POLL = 5.0  # seconds between looks at herdr agent list, while the bridge is on, herdr is on PATH and a lane has a session id
+HERDR_STALE = 15.0  # an answer this old (herdr failing since, or printing what kabu cannot read) is no longer used
+HERDR_WAIT = 3.0  # herdr agent list gets this long, and 4 MiB, to answer; then it is killed: no answer, which changes nothing
+
+
+def herdr_on() -> bool:
+    """Whether the Herdr bridge is on (kabu presence herdr on): off by default."""
+    return os.path.lexists(presence_dir() / "herdr")
+
+
+def herdr_agents(out: bytes) -> Optional[Dict[str, str]]:
+    """What herdr agent list printed, as {agent_session.value: agent_status}, or None when it is not that list. Nothing
+    else is read from it; a session id two agents name says nothing."""
+    try:
+        doc = json.loads(out.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):  # nested past Python's limit: not herdr's list either
+        return None
+    result = doc.get("result") if isinstance(doc, dict) else None
+    agents = result.get("agents") if isinstance(result, dict) else None
+    if not isinstance(agents, list):
+        return None
+    found: Dict[str, str] = {}
+    shared: Set[str] = set()
+    for agent in agents:
+        ses = agent.get("agent_session") if isinstance(agent, dict) else None
+        value, status = (ses.get("value") if isinstance(ses, dict) else None), (agent.get("agent_status") if isinstance(agent, dict) else None)
+        if isinstance(value, str) and value and isinstance(status, str):
+            shared |= {value} if value in found else set()
+            found[value] = status
+    return {value: status for value, status in found.items() if value not in shared}
+
+
+def herdr_list(exe: str) -> Optional[bytes]:
+    """herdr agent list's output, when it exits 0 within HERDR_WAIT and 4 MiB; else None, and it is killed with whatever
+    it started. It is always reaped: the bridge leaves no process behind."""
+    import select
+    try:
+        proc = subprocess.Popen([exe, "agent", "list"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError:
+        return None
+    assert proc.stdout is not None
+    out, ended, deadline = b"", False, time.monotonic() + HERDR_WAIT
+    try:
+        while len(out) <= 4 << 20:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([proc.stdout], [], [], left)[0]:
+                break
+            chunk = os.read(proc.stdout.fileno(), 1 << 16)
+            ended = not chunk
+            if ended:
+                break
+            out += chunk
+        if ended:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        ended = False
+    finally:
+        if proc.poll() is None or not ended:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        proc.stdout.close()
+        proc.wait()
+    return out if ended and proc.returncode == 0 else None
 
 
 class Reporter:
@@ -1751,6 +1958,13 @@ class Reporter:
         self.failures = 0
         self.quiet_since = clock()
         self.status: JSON = {}
+        self.herdr: Dict[str, str] = {}  # Herdr's last answer, {session id: agent_status}, and when it came
+        self.herdr_at = self.herdr_next = 0.0
+        self.herdr_status: JSON = {}
+
+    def report(self) -> JSON:
+        """What status.json shows: the last batch, and the bridge's last look (never what Herdr printed)."""
+        return {**self.status, **({"herdr": self.herdr_status} if self.herdr_status else {})}
 
     def scan(self, now: float) -> None:
         """Fold every lane's records and keep only its latest. A new lane is adopted only while its harness runs, is no
@@ -1766,6 +1980,7 @@ class Reporter:
                 self.forget(key, first.files)  # exited, ended or stale before anyone reported it: nothing to say
                 continue
             self.lanes[key] = Lane(first.rec, first.mtime, proc.start, proc.name, checked=now)
+        retired: Dict[str, Lane] = {}
         for key, lane in self.lanes.items():
             got = seen.get(key)
             if got is None:
@@ -1775,9 +1990,16 @@ class Reporter:
                 if path not in got.latest and record(path, int(got.rec["pid"])):
                     unlink(path)
             if got.rec["seq"] != lane.rec["seq"] or got.mtime != lane.mtime:
+                if lane.session and lane.rec.get("sid") and got.rec.get("sid") and got.rec["sid"] != lane.rec["sid"]:
+                    # Another session in the same process (pi's /new or /resume): the one before goes offline once, and
+                    # this lane gets or creates the new one's.
+                    retired[f"{key}~{lane.rec['seq']}"] = Lane(lane.rec, lane.mtime, lane.start, lane.name, now, lane.session,
+                                                               lane.sent, gone=now)
+                    lane.session = lane.sent = lane.want = None
                 lane.rec, lane.mtime = got.rec, got.mtime
                 if lane.gone and got.rec["runtime"] != "offline" and alive(int(got.rec["pid"])):
                     lane.gone = 0.0  # the session went on in the same process, as after Claude Code's /clear
+        self.lanes.update(retired)
 
     def check(self, now: float) -> None:
         """A harness whose process exited, is a zombie, or whose id another process took, or whose session ended,
@@ -1797,16 +2019,46 @@ class Reporter:
     def value(self, lane: Lane, now: float) -> Optional[Tuple[str, Optional[str]]]:
         """What a lane reports in a batch now, or None: what it reads, but the last value taken while working and idle
         settle, and nothing for an exited session that was never reported or is reported offline already."""
-        if lane.gone:
+        if lane.gone:  # ended, or its harness exited: offline, whatever Herdr says
+            lane.source = str(lane.rec.get("source") or "hook")
             return None if lane.sent in (None, ("offline", None)) else ("offline", None)
         runtime, attention = str(lane.rec["runtime"]), lane.rec.get("attention")
-        if runtime == "working" and attention is None and lane.rec.get("event") != "tool" and now - lane.mtime > PRESENCE_DECAY:
+        herdr = self.herdr_value(lane, now)
+        lane.source = "herdr" if herdr else str(lane.rec.get("source") or "hook")
+        if herdr:
+            runtime, attention = herdr  # Herdr's view beats the hooks' working and idle
+        elif runtime == "working" and attention is None and lane.rec.get("event") != "tool" and now - lane.mtime > PRESENCE_DECAY:
             runtime = "idle"  # a turn the hooks lost the end of (an interrupt): no event for 15 minutes, no tool running
         want = (runtime, attention)
         if lane.want != want:
             lane.want, lane.since = want, now
         settling = lane.sent is not None and {lane.sent[0], runtime} == {"working", "idle"} and lane.sent[1] is None and attention is None
         return lane.sent if settling and now - lane.since < PRESENCE_SETTLE else want
+
+    def look_herdr(self, now: float) -> None:
+        """Every HERDR_POLL, while the bridge is on, herdr is on PATH and a lane has a session id to join on: run herdr
+        agent list. An answer kabu cannot read (or none) changes nothing: the last one stands until HERDR_STALE."""
+        if now < self.herdr_next:
+            return
+        self.herdr_next = now + HERDR_POLL
+        exe = shutil.which("herdr") if herdr_on() else None
+        if exe is None or not any(lane.rec.get("sid") for lane in self.lanes.values() if not lane.gone):
+            self.herdr, self.herdr_at, self.herdr_status = {}, 0.0, {"on": herdr_on(), "found": exe is not None} if herdr_on() else {}
+            return
+        out = herdr_list(exe)
+        got = herdr_agents(out) if out is not None else None
+        if got is not None:
+            self.herdr, self.herdr_at = got, now
+        self.herdr_status = {"on": True, "found": True, "at": iso(now), "read": got is not None,
+                             "joined": sum(bool(self.herdr_value(lane, now)) for lane in self.lanes.values())}
+
+    def herdr_value(self, lane: Lane, now: float) -> Optional[Tuple[str, Optional[str]]]:
+        """Herdr's state for a lane, through HERDR_STATES: only for the exact session id, only from an answer Herdr gave
+        after the lane's latest record (a prompt, a permission prompt or a stop since then beats what Herdr saw before
+        it), and only while that answer is recent: a look that failed since never makes it newer."""
+        sid = str(lane.rec.get("sid") or "")
+        fresh = bool(sid) and self.herdr_at > lane.mtime and now - self.herdr_at <= HERDR_STALE
+        return HERDR_STATES.get(self.herdr.get(sid, "")) if fresh else None
 
     def step(self) -> bool:
         """One look and, when due, one batch. False once the reporter should exit: presence was turned off, or there
@@ -1817,6 +2069,7 @@ class Reporter:
         self.check(now)
         for lane in self.lanes.values():
             lane.gone = lane.gone or (0.0 if on else now)
+        self.look_herdr(now)
         values = {key: self.value(lane, now) for key, lane in self.lanes.items()}
         changed = any(v is not None and v != self.lanes[key].sent for key, v in values.items())
         beat = any(v is not None for v in values.values()) and now >= self.next_beat
@@ -1858,7 +2111,7 @@ class Reporter:
         self.seq += 1
         body = {"instance": self.inst["instance"], "generation": self.inst["generation"], "seq": self.seq,
                 "reports": [{"session": lane.session, "lane": "ln_" + keyed(self.inst, "lane", key, lane.start)[:32],
-                             "runtime": value[0], "attention": value[1], "source": lane.rec.get("source") or "hook"}
+                             "runtime": value[0], "attention": value[1], "source": lane.source}
                             for key, lane, value in reports]}
         self.sent_at.append(now)
         beat: JSON = {"at": iso(now), "generation": body["generation"], "seq": self.seq, "reports": len(reports)}
@@ -1946,11 +2199,11 @@ def presence_run(a: JSON) -> int:
         reporter, shown = Reporter(connect, inst, folder), None
         try:
             while reporter.step():
-                if reporter.status != shown:  # written when it changes, not every tick
-                    write_private(folder / "status.json", reporter.status)
-                    shown = dict(reporter.status)
+                if reporter.report() != shown:  # written when it changes, not every tick
+                    shown = reporter.report()
+                    write_private(folder / "status.json", shown)
                 time.sleep(PRESENCE_TICK)
-            write_private(folder / "status.json", reporter.status)
+            write_private(folder / "status.json", reporter.report())
         finally:
             if (read_private(folder / "run.pid") or b"").strip() == str(os.getpid()).encode():
                 unlink(folder / "run.pid")
@@ -1978,27 +2231,80 @@ def presence_status() -> JSON:
     return {"ok": True, "enabled": presence_on(), "off": os.path.lexists(presence_dir() / "off"),
             "opted_out": os.environ.get("KABU_PRESENCE") == "0", "running": pid > 1 and alive(pid), "pid": pid if pid > 1 and alive(pid) else None,
             "instance": inst.get("instance"), "generation": inst.get("generation"), "dir": str(folder), "lanes": lanes,
-            "last_beat": run.get("last_beat"), "ack": run.get("ack")}
+            "last_beat": run.get("last_beat"), "ack": run.get("ack"),
+            "herdr": {"on": herdr_on(), "found": shutil.which("herdr") is not None, "last": run.get("herdr")}}
 
 
 def settings_file(harness_name: str, given_path: Optional[str]) -> Path:
-    """A harness's user settings: Claude Code's CLAUDE_CONFIG_DIR (~/.claude), Copilot CLI's COPILOT_HOME (~/.copilot)."""
+    """A harness's user settings (HARNESS_FILES): Claude Code's CLAUDE_CONFIG_DIR (~/.claude) settings.json, Copilot
+    CLI's COPILOT_HOME (~/.copilot) settings.json, Codex's CODEX_HOME (~/.codex) hooks.json, Gemini CLI's
+    ~/.gemini/settings.json, Cursor's ~/.cursor/hooks.json, pi's PI_CODING_AGENT_DIR (~/.pi/agent) extension file."""
     if given_path:
         return Path(os.path.expanduser(given_path))
-    home = os.environ.get("CLAUDE_CONFIG_DIR" if harness_name == "claude" else "COPILOT_HOME")
-    return Path(home or Path.home() / (".claude" if harness_name == "claude" else ".copilot")) / "settings.json"
+    variable, folder, name = HARNESS_FILES[harness_name]
+    return Path(os.environ.get(variable) or Path.home() / folder if variable else Path.home() / folder) / name
+
+
+def hook_command(event: str, slug: str, hook: Path) -> str:
+    """The hook command of a harness that runs it in a shell kabu does not choose (Codex: $SHELL -lc, which may be zsh
+    or fish; Gemini CLI: bash; Cursor): /bin/sh, exec'd so that the harness stays its parent ($PPID, the lane). Cursor's
+    beforeSubmitPrompt also answers {"continue": true}, whatever the hook did."""
+    inner = f'kabu_event={event} kabu_harness={slug}; [ ! -r "{hook}" ] || (. "{hook}") || true'
+    return f"exec /bin/sh -c '{inner}" + ('; echo {\\"continue\\":true}' if event == "beforeSubmitPrompt" else "") + "'"
 
 
 def hook_entries(harness_name: str, hook: Path) -> Dict[str, JSON]:
-    """The hook's entry for each event, under the harness's own name for it: Claude Code's matcher groups, or Copilot
-    CLI's native keys (sessionStart, userPromptSubmitted, …, agentStop) with flat {type, bash, timeoutSec} entries."""
+    """The hook's entry for each event, under the harness's own name for it, in its settings' own shape: Claude Code's
+    matcher groups; Copilot CLI's native keys with flat {type, bash, timeoutSec}; Codex's groups (timeouts in seconds,
+    at most 3 for SessionEnd and Interrupt); Gemini CLI's named groups (timeouts in milliseconds); Cursor's flat
+    {command, timeout}."""
     entries: Dict[str, JSON] = {}
-    for event in HOOK_EVENTS:
+    for event in HARNESS_EVENTS.get(harness_name, HOOK_EVENTS):
         name = COPILOT_EVENTS[event] if harness_name == "copilot" else event
         command = f"kabu_event={name}; [ ! -r {shlex.quote(str(hook))} ] || (. {shlex.quote(str(hook))}) || true"
-        entries[name] = {"type": "command", "bash": command, "timeoutSec": 5} if harness_name == "copilot" else \
-            {**({"matcher": NEEDS_INPUT} if event == "Notification" else {}), "hooks": [{"type": "command", "command": command, "timeout": 5}]}
+        if harness_name in ("codex", "gemini", "cursor"):
+            command = hook_command(event, HARNESS_SLUGS[harness_name], hook)
+        if harness_name == "copilot":
+            entries[name] = {"type": "command", "bash": command, "timeoutSec": 5}
+        elif harness_name == "codex":
+            entries[name] = {"hooks": [{"type": "command", "command": command, "timeout": 3 if event in ("SessionEnd", "Interrupt") else 5}]}
+        elif harness_name == "gemini":
+            entries[name] = {"hooks": [{"name": f"kabu-presence-{event}", "type": "command", "command": command, "timeout": 5000}]}
+        elif harness_name == "cursor":
+            entries[name] = {"command": command, "timeout": 5}
+        else:
+            entries[name] = {**({"matcher": NEEDS_INPUT} if event == "Notification" else {}),
+                             "hooks": [{"type": "command", "command": command, "timeout": 5}]}
     return entries
+
+
+PI_MARKER = PI_EXTENSION.split("\n", 1)[0].encode()
+
+
+def pi_install(a: JSON, install: bool) -> JSON:
+    """Write pi's presence extension (PI_EXTENSION, with this CLI's path) into its extensions folder (made 0700 when
+    missing), or take it out, after a backup of what was there; never through a link. A file there that kabu did not
+    write is left alone (exit 2)."""
+    path = settings_file("pi", a["settings"])
+    text = PI_EXTENSION.replace('const KABU_CLI = "";', f"const KABU_CLI = {json.dumps(os.path.abspath(__file__))};", 1).encode()
+    target = SettingsFile.open(path, create=install)
+    raw, saved, changed = None, None, False
+    if target is not None:
+        try:
+            raw = target.read()[0]
+            if raw is not None and not raw.startswith(PI_MARKER):
+                raise CliError("invalid_settings", f"{path} is not kabu's pi extension, so kabu left it as it is.",
+                               "Move it away, or name another file with --settings, then run this again.")
+            changed = raw != text if install else raw is not None
+            saved = target.backup(raw) if changed and raw is not None else None
+            if changed and install:
+                target.replace(text, 0o600)
+            elif changed:
+                target.remove()
+        finally:
+            target.close()
+    return {"ok": True, "harness": "pi", "settings": str(path), "hook": str(path), "installed": install,
+            "events": list(HARNESS_EVENTS["pi"]) if install else [], "changed": changed, "backup": saved}
 
 
 def ours(entry: Any) -> bool:
@@ -2010,38 +2316,141 @@ def digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def backup(path: Path, raw: bytes) -> Path:
-    """A new 0600 copy of a settings file's bytes, beside it, under a name no other backup has."""
-    name = path.with_name(f"{path.name}.bak-kabu-presence-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}-{uuid.uuid4().hex[:6]}")
-    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as out:
-        out.write(raw)
-    return name
+def settings_dir(folder: Path, create: bool = False) -> Optional[int]:
+    """A settings file's folder, opened one component at a time from /, following no link but the system's own (root
+    owns /var and /tmp on a Mac; no user process can plant one of those), each missing one made 0700 when create, else
+    None; the folder itself this user's. Every read and write of the file then goes through this descriptor."""
+    parts = Path(os.path.abspath(folder)).parts
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for i, part in enumerate(parts[1:], 2):
+            shown = Path(*parts[:i])
+            try:
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return None
+                os.mkdir(part, 0o700, dir_fd=fd)
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            link = stat.S_ISLNK(st.st_mode)
+            if link and st.st_uid != 0:
+                raise CliError("unsafe_settings", f"{shown} is a link, and kabu never writes through one.",
+                               f"Pass the real path with --settings (under {os.path.realpath(shown)}), then run this again.")
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | (0 if link else os.O_NOFOLLOW), dir_fd=fd)
+            except OSError as exc:
+                raise CliError("unsafe_settings", f"{shown} is not a folder kabu can use ({exc.strerror}).",
+                               "Pass another path with --settings, then run this again.") from None
+            os.close(fd)
+            fd = nxt
+        if os.fstat(fd).st_uid != os.getuid():
+            raise CliError("unsafe_settings", f"{folder} is not a folder of this user's.", "Pass another path with --settings, then run this again.")
+        return fd
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
 
 
-def put_settings(path: Path, raw: bytes, mode: int) -> None:
-    """Replace the settings file at once (temp and rename, beside the file a link names), never looser than 0600."""
-    real = path.resolve()
-    tmp = real.with_name(f".{real.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as out:
-        out.write(raw)
-    os.chmod(tmp, mode & 0o600)
-    os.replace(tmp, real)
+@dataclass
+class SettingsFile:
+    """A harness's settings file (or pi's extension), read, backed up, replaced and removed only through its folder's
+    verified descriptor (settings_dir): never through a link, the file's own or a folder's."""
+
+    path: Path
+    dir: int
+
+    @classmethod
+    def open(cls, path: Path, create: bool = False) -> Optional[SettingsFile]:
+        fd = settings_dir(path.parent, create)
+        return None if fd is None else cls(path, fd)
+
+    def close(self) -> None:
+        os.close(self.dir)
+
+    def read(self, name: str = "") -> Tuple[Optional[bytes], int]:
+        """The file's bytes and mode (or a backup's, by name, beside it); None when there is none. A link, or anything
+        but a regular file of this user's, is refused."""
+        name = name or self.path.name
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.dir)
+        except FileNotFoundError:
+            return None, 0o600
+        except OSError:
+            raise CliError("unsafe_settings", f"{self.path.parent / name} is a link, and kabu never writes through one.",
+                           "Pass the real path with --settings, then run this again.") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise CliError("unsafe_settings", f"{self.path.parent / name} is not a file of this user's.", "Pass another path with --settings.")
+            chunks: List[bytes] = []
+            while True:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    return b"".join(chunks), st.st_mode & 0o777
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+
+    def write(self, name: str, raw: bytes, mode: int = 0o600) -> None:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.dir)
+        with os.fdopen(fd, "wb") as out:
+            out.write(raw)
+            os.fchmod(out.fileno(), mode & 0o600)
+
+    def backup(self, raw: bytes) -> str:
+        """A new 0600 copy of the file's bytes, beside it, under a name no other backup has."""
+        name = f"{self.path.name}.bak-kabu-presence-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}-{uuid.uuid4().hex[:6]}"
+        self.write(name, raw)
+        return str(self.path.with_name(name))
+
+    def replace(self, raw: bytes, mode: int) -> None:
+        """Put new bytes in place at once (a new file renamed over the name: a link there is replaced, never written
+        through), never looser than 0600."""
+        tmp = f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        self.write(tmp, raw, mode)
+        os.rename(tmp, self.path.name, src_dir_fd=self.dir, dst_dir_fd=self.dir)
+
+    def remove(self) -> None:
+        os.unlink(self.path.name, dir_fd=self.dir)
 
 
 def presence_install(a: JSON, install: bool) -> JSON:
     """Add the presence hook to a harness's settings, or take it out, after a backup. Install is idempotent; uninstall
     puts back the exact bytes from before the install when the file is as kabu left it, else takes out only kabu's
     entries. The hook file goes once no settings use it (presence/installs.json keeps what was installed where)."""
+    if a["harness"] == "pi":
+        return pi_install(a, install)
     path, hook, manifest_path = settings_file(a["harness"], a["settings"]), kabu_home() / HOOK_FILE, presence_dir() / "installs.json"
     if not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)) or not own_dir(presence_dir(), create=True):
         raise CliError("unsafe_folder", f"{presence_dir()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
+    if re.search(r"[\x00-\x1f'\"$`\\]", os.path.abspath(hook)):  # it goes inside the quotes of hook_command
+        raise CliError("unsafe_folder", f"{hook} has a quote, $, ` or \\ in its path, which a hook command cannot hold.",
+                       "Set KABU_HOME to a folder without them, then run this again.")
+    target = SettingsFile.open(path)
+    if target is None and install:
+        raise CliError("missing_folder", f"{path.parent} does not exist, so kabu has no settings to add to.",
+                       "Start the harness once, or name the settings file with --settings, then run this again.")
+    if target is None:  # nothing to take out: only what kabu kept of it goes
+        manifest = read_json(manifest_path)
+        manifest.pop(str(path.resolve()), None)
+        if not manifest:
+            unlink(hook)
+        write_private(manifest_path, manifest)
+        return {"ok": True, "harness": a["harness"], "settings": str(path), "hook": str(hook), "installed": False, "events": [],
+                "changed": False, "backup": None}
     try:
-        raw: Optional[bytes] = path.read_bytes()
-        mode = path.stat().st_mode & 0o777
-    except FileNotFoundError:
-        raw, mode = None, 0o600
+        return settings_install(a, install, path, hook, manifest_path, target)
+    finally:
+        target.close()
+
+
+def settings_install(a: JSON, install: bool, path: Path, hook: Path, manifest_path: Path, target: SettingsFile) -> JSON:
+    """presence_install's work on a settings file reached through its verified folder (SettingsFile)."""
+    raw, mode = target.read()
     try:
         settings = json.loads(raw) if raw and raw.strip() else {}
     except ValueError as exc:
@@ -2060,28 +2469,29 @@ def presence_install(a: JSON, install: bool) -> JSON:
         write_private(hook, PRESENCE_HOOK.replace(HOOK_CLI, f"kabu_cli={shlex.quote(os.path.abspath(__file__))}", 1).encode())
         for event, added in hook_entries(a["harness"], hook).items():
             hooks[event] = [*(hooks.get(event) or []), added]
-        updated = {**settings, "hooks": hooks}
+        updated = {**({"version": 1} if a["harness"] == "cursor" else {}), **settings, "hooks": hooks}  # Cursor needs its version
         new = (json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode()
         changed = updated != settings
         if changed:
-            saved += [str(backup(path, raw))] if raw is not None else []
-            put_settings(path, new, mode)
+            saved += [target.backup(raw)] if raw is not None else []
+            target.replace(new, mode)
             manifest[key] = {"harness": a["harness"], "before": entry.get("before", digest(raw) if raw is not None else None),
                              "backup": entry.get("backup", saved[0] if saved else None), "after": digest(new)}
     else:
         changed = raw is not None and (key in manifest or any(ours(e) for v in settings.get("hooks", {}).values() for e in (v if isinstance(v, list) else [])))
         if changed and raw is not None:
-            saved.append(str(backup(path, raw)))
-            first = read_private(Path(entry["backup"]), 1 << 26) if entry.get("backup") else None
+            saved.append(target.backup(raw))
+            kept_backup = Path(str(entry.get("backup") or ""))  # read beside the file, through its folder, or not at all
+            first = target.read(kept_backup.name)[0] if entry.get("backup") and kept_backup.parent == path.parent else None
             if entry and digest(raw) == entry.get("after") and entry.get("before") is None:
-                path.unlink()  # kabu made the file: as kabu left it, it goes
+                target.remove()  # kabu made the file: as kabu left it, it goes
             elif entry and digest(raw) == entry.get("after") and first is not None and digest(first) == entry.get("before"):
-                put_settings(path, first, mode)  # as kabu left it: the bytes from before, exactly
+                target.replace(first, mode)  # as kabu left it: the bytes from before, exactly
             else:  # edited since: only kabu's entries go
                 updated = {**settings, "hooks": hooks}
                 if not hooks and "hooks" not in json.loads(first or b"{}"):
                     updated.pop("hooks")
-                put_settings(path, (json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode(), mode)
+                target.replace((json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode(), mode)
         manifest.pop(key, None)
         if not manifest:
             unlink(hook)
@@ -2097,6 +2507,16 @@ def cmd_presence(cmd: str, a: JSON) -> int:
     check(cmd, COMMANDS[cmd].opts, a)
     if action == "run":
         return presence_run(a)
+    if action == "herdr":
+        if a["state"] not in ("on", "off"):
+            raise CliError("missing_argument" if a["state"] is None else "invalid_value", "kabu presence herdr takes on or off.",
+                           "Example: kabu presence herdr on")
+        if not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)) or not own_dir(presence_dir(), create=True):
+            raise CliError("unsafe_folder", f"{presence_dir()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
+        if a["state"] == "on":
+            write_private(presence_dir() / "herdr", {"herdr": True})
+        else:
+            unlink(presence_dir() / "herdr")
     if action in ("on", "off"):
         if not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)) or not own_dir(presence_dir(), create=True):
             raise CliError("unsafe_folder", f"{presence_dir()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
@@ -2106,7 +2526,7 @@ def cmd_presence(cmd: str, a: JSON) -> int:
             unlink(presence_dir() / "off")
     if action in ("install", "uninstall"):
         if not a["harness"]:
-            raise CliError("missing_flag", f"kabu presence {action} needs --harness claude or copilot.",
+            raise CliError("missing_flag", f"kabu presence {action} needs --harness claude, copilot, codex, gemini, cursor or pi.",
                            f"Example: kabu presence {action} --harness claude")
         return emit(presence_install(a, action == "install"))
     return emit(presence_status())
@@ -2166,10 +2586,16 @@ COMMANDS = {
     "presence run": Command(cmd_presence, "Report this machine's agent sessions to Kabu until none is left for 10 minutes. The "
                             "hook starts it; a second one exits at once.", """\
   kabu presence run &""", CONNECTION),
+    "presence herdr": Command(cmd_presence, "Turn the Herdr bridge on or off on this machine (off by default): while on and herdr "
+                             "is on PATH, the reporter reads herdr agent list every 5 s, and Herdr's state for a session it names "
+                             "by the same id beats the hooks' working and idle. Prints the status.", """\
+  kabu presence herdr on""", (), ("state", "?", "on or off")),
     "presence install": Command(cmd_presence, "Add the presence hook to a harness's settings, after a backup; running it again "
                                 "changes nothing. Not needed with the Kabu plugin, which has the hook.", """\
   kabu presence install --harness claude
-  kabu presence install --harness copilot --settings ~/.copilot-work/settings.json""", PRESENCE_SETTINGS),
+  kabu presence install --harness copilot --settings ~/.copilot-work/settings.json
+  kabu presence install --harness codex       Codex then asks you to trust its hooks once, in /hooks
+  kabu presence install --harness pi          an extension pi loads at its next start""", PRESENCE_SETTINGS),
     "presence uninstall": Command(cmd_presence, "Take the presence hook out of a harness's settings, after a backup.", """\
   kabu presence uninstall --harness claude""", PRESENCE_SETTINGS),
 }
