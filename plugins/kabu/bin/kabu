@@ -21,7 +21,7 @@ the hint is the next step, usually a corrected command. Nothing is ever coloured
 Exit codes: 0 ok (an ask approved, or a choice or text answered), 2 usage or validation error (nothing was sent),
 3 network or API error, or an answer kabu does not know, 10 rejected, 20 expired, 21 cancelled or deleted, 130 interrupted.
 Environment: KABU_API_KEY, KABU_BASE_URL (default https://usekabu.com), KABU_PROJECT, KABU_AGENT, KABU_SOURCE,
-KABU_SESSION, KABU_AUTO_SESSION=1 (one session per host, project and agent), KABU_CONFIG_PATH (default
+KABU_SESSION, KABU_AUTO_SESSION=1 (an automatic session per host, project and agent), KABU_CONFIG_PATH (default
 ~/.config/kabu/config.json, written by kabu login, mode 600), KABU_PRESENCE=0 (presence off), KABU_HOME (default
 ~/.kabu: presence's reporter identity), KABU_RUNTIME_DIR (default XDG_RUNTIME_DIR or TMPDIR: presence's records).
 """
@@ -42,6 +42,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import socket
 import stat
 import subprocess
@@ -53,7 +54,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -983,18 +984,19 @@ def cmd_message(cmd: str, a: JSON) -> int:
 
 
 def auto_session(api: Api, body: JSON, key: str, scope: str = "") -> None:
-    """KABU_AUTO_SESSION=1: one session per host, project and agent groups their messages and shows on the Lock Screen
-    (a Live Activity; each ask in it has its own). One try of up to 3 s; an ended or expired session (the API returns a
-    run's session even then), or any failure, sends the message without one. With no project in the message, the session
-    names none either: the API picks it as for the message (a bound key's). A `scope`, this agent session's key, makes it
-    this session's own, as a gone session's stand-in is."""
+    """KABU_AUTO_SESSION=1: one automatic session per host, project and agent groups their messages (ADR 022): it claims
+    no run, so it stays idle and has no Live Activity of its own; each ask in it has its own. `kabu session start` is
+    the explicit, live run. One try of up to 3 s; an ended or expired session (the API returns a run's session even
+    then), or any failure, sends the message without one. With no project in the message, the session names none
+    either: the API picks it as for the message (a bound key's). A `scope`, this agent session's key, makes it this
+    session's own, as a gone session's stand-in is."""
     host, project, agent = socket.gethostname().split(".")[0], body.get("project"), body["agent"]
     tail = f":{scope}" if scope else ""
     try:
         session = Api(api.base, api.key, 3.0, 0).call("POST", "/v2/sessions", {
             "title": f"{agent} on {host}{f' · {project}' if project else ''}"[:80], **({"project": project} if project else {}),
             "agent": agent, "external_id": f"auto:{host}:{project or ''}:{agent}"[:120 - len(tail)] + tail,
-            "live": {"enabled": True}}, idem=f"{key}-session")
+            "automatic": True}, idem=f"{key}-session")
     except CliError:
         return  # a session only groups messages: it never stops one
     if isinstance(session.get("id"), str) and session.get("status") not in ("ended", "expired") and not session.get("ended_at"):
@@ -1190,27 +1192,94 @@ def cmd_mcp(cmd: str, a: JSON) -> int:
                                                           "data": shown}})
 
     pending: List[threading.Thread] = []
-    for line in filter(None, (raw.strip() for raw in sys.stdin.buffer)):
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            msg = None  # sent as it is: the server answers with a parse error
-        call = msg.get("params") if isinstance(msg, dict) and msg.get("method") == "tools/call" else None
-        call = call if isinstance(call, dict) else {}
-        tool = call.get("name")  # a str, unless the harness sent something odd
-        args = call.setdefault("arguments", {}) if isinstance(tool, str) and tool in takes and not bound else None
-        project = tool_project() if isinstance(args, dict) and not args.get("project") else None
-        if project and isinstance(args, dict):
-            args["project"] = project
-            line = json.dumps(msg).encode()
-        if isinstance(msg, dict) and "method" in msg and "id" in msg:  # a request runs alongside the others
-            pending = [t for t in pending if t.is_alive()] + [threading.Thread(target=forward, args=(line, msg), daemon=True)]
-            pending[-1].start()
-        else:  # notifications and replies keep their order
-            forward(line, msg)
-    for thread in pending:
-        thread.join()
+    presence = McpPresence(api)
+    before = signal.signal(signal.SIGTERM, lambda *_: sys.exit(EXIT_OK))  # a harness that stops it so: offline too, below
+    try:
+        for line in filter(None, (raw.strip() for raw in sys.stdin.buffer)):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                msg = None  # sent as it is: the server answers with a parse error
+            call = msg.get("params") if isinstance(msg, dict) and msg.get("method") == "tools/call" else None
+            call = call if isinstance(call, dict) else {}
+            tool = call.get("name")  # a str, unless the harness sent something odd
+            ses = presence.start() if isinstance(msg, dict) and msg.get("method") == "tools/call" else None  # after a call
+            args = call.setdefault("arguments", {}) if isinstance(tool, str) and tool in takes else None
+            project = tool_project() if isinstance(args, dict) and not args.get("project") and not bound else None
+            if project and isinstance(args, dict):
+                args["project"] = project
+            if ses and isinstance(args, dict) and not args.get("session"):
+                args["session"] = ses  # the harness's automatic session, which its hooks and kabu send share
+            if project or ses and isinstance(args, dict) and args.get("session") == ses:
+                line = json.dumps(msg).encode()
+            if isinstance(msg, dict) and "method" in msg and "id" in msg:  # a request runs alongside the others
+                pending = [t for t in pending if t.is_alive()] + [threading.Thread(target=forward, args=(line, msg), daemon=True)]
+                pending[-1].start()
+            else:  # notifications and replies keep their order
+                forward(line, msg)
+        for thread in pending:
+            thread.join()
+    finally:
+        presence.stop()  # its lane offline; the session is never ended: hooks share it, and a resumed run gets it back
+        signal.signal(signal.SIGTERM, before)
     return EXIT_OK
+
+
+class McpPresence:
+    """kabu mcp's presence (ADR 021, 022; CONTRACT.md, MCP bridge). Nothing before the first tool call; then the
+    harness's automatic session, got or created once on the hooks' HMAC ladder (one ses_ per run), and an online
+    record from source mcp, which stop() turns offline. It never ends the session."""
+
+    def __init__(self, api: Api) -> None:
+        self.api, self.started = api, False
+        self.session: Optional[str] = None
+        self.folder: Optional[Path] = None
+        self.pid, self.sid = 0, ""
+
+    def start(self) -> Optional[str]:
+        if self.started:
+            return self.session
+        self.started = True
+        parent = ancestors()[:1]  # only when a harness started it, as its MCP server: never a kabu mcp a script runs
+        agent, folder = (parent[0] if parent and parent[0][2] in AGENT_PROCESSES else None), runtime_dir()
+        if agent is None or not presence_on() or not own_dir(folder, create=True):
+            return None
+        pid, lane, started = agent[0], f"l{agent[0]}", proc_start(agent[1])
+        got = fold(folder, pid).get(lane)
+        if got is not None and got.rec["runtime"] != "offline" and started is not None and got.mtime >= started - 1:
+            self.sid = str(got.rec.get("sid") or "")  # the hooks' session id, so the same session
+        elif os.environ.get("CLAUDE_PID") == str(pid):
+            self.sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "") if re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", os.environ.get(
+                "CLAUDE_CODE_SESSION_ID", "")) else ""
+        try:
+            self.session = lane_session(self.api, installation(), folder, lane, {"pid": pid, "sid": self.sid}, agent[1], agent[2], 3.0)
+        except (OSError, ValueError):
+            self.session = None
+        if put_record(folder, pid, {"event": "mcp", "runtime": "online", "attention": None, "source": "mcp", "sid": self.sid, "pane": ""}):
+            self.folder, self.pid = folder, pid
+            spawn_reporter(folder, self.api)
+        return self.session
+
+    def stop(self) -> None:
+        if self.folder is not None:
+            put_record(self.folder, self.pid, {"event": "end", "runtime": "offline", "attention": None, "source": "mcp", "sid": self.sid,
+                                               "pane": ""})
+            self.folder = None
+
+
+def spawn_reporter(folder: Path, api: Api) -> None:
+    """Start kabu presence run when none runs, as the hook does: the one process that outlives this one."""
+    try:
+        pid = int((read_private(folder / "run.pid") or b"0").strip() or 0)
+    except ValueError:
+        pid = 0
+    if pid > 1 and alive(pid):
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "presence", "run"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, env={**os.environ, "KABU_API_KEY": api.key, "KABU_BASE_URL": api.base})
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------------------------------- presence --
@@ -1488,11 +1557,13 @@ def proc_start(token: str) -> Optional[float]:
 
 @dataclass
 class Folded:
-    """An agent session's records, folded: the latest event's state and the files that made it."""
+    """An agent session's records, folded: the latest event's state, the files that made it, and the latest file of
+    each source, which stay."""
 
     rec: JSON
     mtime: float
     files: List[Path]
+    latest: List[Path] = field(default_factory=list)
 
 
 def fold(folder: Path, pid: Optional[int] = None, now: Optional[float] = None) -> Dict[str, Folded]:
@@ -1521,20 +1592,49 @@ def fold(folder: Path, pid: Optional[int] = None, now: Optional[float] = None) -
     out: Dict[str, Folded] = {}
     for lane, items in lanes.items():
         valid = sorted((i for i in items if i[2] is not None), key=lambda i: i[0])
-        if not valid:
+        hooks = [i for i in valid if (i[2] or {}).get("source", "hook") == "hook"]
+        mcp = [i for i in valid if (i[2] or {}).get("source") == "mcp"]
+        top = hooks[-1] if hooks else mcp[-1] if mcp else None  # the hooks' working and idle beat kabu mcp's online
+        if top is None:
             continue
-        rec = dict(valid[-1][2] or {})
+        rec = dict(top[2] or {})
         rec["sid"] = next((str(i[2]["sid"]) for i in reversed(valid) if i[2] and i[2].get("sid")), "")
-        out[lane] = Folded(rec, valid[-1][3], [i[1] for i in items])
+        out[lane] = Folded(rec, top[3], [i[1] for i in items], [last[-1][1] for last in (hooks, mcp) if last])
     return out
 
 
 def record(path: Path, pid: int) -> Optional[JSON]:
-    """One hook record, or None while it is being written or when it is not one."""
+    """One record, a hook's or kabu mcp's (source mcp: online, then offline at its EOF), or None while it is being
+    written or when it is not one."""
     rec = read_json(path)
-    ok = rec.get("pid") == pid and isinstance(rec.get("seq"), int) and rec.get("runtime") in ("working", "idle", "offline") \
-        and rec.get("attention") in (None, "terminal") and isinstance(rec.get("sid", ""), str)
+    ok = rec.get("pid") == pid and isinstance(rec.get("seq"), int) and rec.get("attention") in (None, "terminal") \
+        and isinstance(rec.get("sid", ""), str) and (rec.get("runtime") in ("working", "idle", "offline") and rec.get("source", "hook") == "hook"
+                                                     or rec.get("runtime") in ("online", "offline") and rec.get("source") == "mcp")
     return rec if ok else None
+
+
+def put_record(folder: Path, pid: int, rec: JSON) -> bool:
+    """Write a record as the hook does (kabu mcp's): a new 0600 file at the next free seq of the harness's lane, created
+    no-clobber in the folder as opened once, never through a link."""
+    try:
+        dfd = open_dir(folder)
+    except OSError:
+        return False
+    try:
+        top = max((seq_of(Path(n)) for n in os.listdir(dfd) if n.startswith(f"l{pid}-") and RECORD.fullmatch(n)), default=0)
+        for seq in range(top + 1, top + 33):
+            try:
+                fd = os.open(f"l{pid}-{seq}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(json.dumps({"v": 2, **rec, "seq": seq, "pid": pid}) + "\n")
+            return True
+        return False
+    except OSError:
+        return False
+    finally:
+        os.close(dfd)
 
 
 def seq_of(path: Path) -> int:
@@ -1562,7 +1662,8 @@ def api_tag(api: Api) -> str:
 def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start: str, name: str,
                  timeout: float = 10.0) -> Optional[str]:
     """The Kabu session of an agent session: the one kept beside its records for this API, else get or create the
-    session whose external_id is HMAC(installation secret, harness ‖ native session id), with no Live Activity. Its
+    session whose external_id is HMAC(installation secret, harness ‖ native session id), automatic (ADR 022: it
+    claims no run, so it stays idle with no Live Activity of its own). Its
     title is constant ('<harness> session'), and its project the one the harness's folder names, as kabu send's. The
     reporter and a kabu send in that agent session so find the same one. None when the API cannot say."""
     native = str(rec.get("sid") or "") or f"pid:{rec['pid']}:{start}"
@@ -1578,7 +1679,7 @@ def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start
         project = named_project(root.resolve())[0] if root else ""  # never a temp folder's, nor <folder>@<host>
     except OSError:
         project = ""
-    body: JSON = {"title": f"{slug} session", "agent": slug, **({"project": project} if project else {})}
+    body: JSON = {"title": f"{slug} session", "agent": slug, "automatic": True, **({"project": project} if project else {})}
     for n in range(turn, turn + 3):
         try:
             got = Api(api.base, api.key, timeout, 0).call("POST", "/v2/sessions", {**body, "external_id": f"kp_{base}" + (f"-{n}" if n else "")},
@@ -1670,8 +1771,8 @@ class Reporter:
             if got is None:
                 lane.gone = lane.gone or now  # its records were removed: offline
                 continue
-            for path in got.files:  # the latest stays, so the next hook's seq goes on from it
-                if path.name != f"{key}-{got.rec['seq']}.json" and path.name.startswith(key + "-") and record(path, int(got.rec["pid"])):
+            for path in got.files:  # the latest of each source stays, so the next record's seq goes on from it
+                if path not in got.latest and record(path, int(got.rec["pid"])):
                     unlink(path)
             if got.rec["seq"] != lane.rec["seq"] or got.mtime != lane.mtime:
                 lane.rec, lane.mtime = got.rec, got.mtime
@@ -1757,7 +1858,8 @@ class Reporter:
         self.seq += 1
         body = {"instance": self.inst["instance"], "generation": self.inst["generation"], "seq": self.seq,
                 "reports": [{"session": lane.session, "lane": "ln_" + keyed(self.inst, "lane", key, lane.start)[:32],
-                             "runtime": value[0], "attention": value[1], "source": "hook"} for key, lane, value in reports]}
+                             "runtime": value[0], "attention": value[1], "source": lane.rec.get("source") or "hook"}
+                            for key, lane, value in reports]}
         self.sent_at.append(now)
         beat: JSON = {"at": iso(now), "generation": body["generation"], "seq": self.seq, "reports": len(reports)}
         try:
