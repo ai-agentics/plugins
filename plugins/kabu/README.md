@@ -103,7 +103,7 @@ hooks and gone 10 minutes after the last session ends, sends the state about onc
 changes.
 
 What leaves your computer: the state (working, idle, waiting at the computer, gone), ids made from a hash (never the
-client's own session id), the client's name (`claude-code`) and the project the session runs in, as `kabu send` already
+client's own session id), the client's name (such as `claude-code`) and the project the session runs in, as `kabu send` already
 sends with every message. Never a prompt, a file path, a tool name, a title or your computer's name. `kabu send` and
 `kabu ask` in the same session go in that session.
 
@@ -115,6 +115,25 @@ sends with every message. Never a prompt, a file path, a tool name, a title or y
 
 Without the plugin, `kabu presence install --harness claude` (or `--harness copilot`) adds the same hook to the
 client's settings, after a backup; `kabu presence uninstall` takes it out. Use one or the other.
+
+Other agents get presence the same way, with `kabu presence install --harness NAME` and the `kabu` CLI on your PATH:
+
+| Agent | `--harness` | How it reports | Note |
+|---|---|---|---|
+| Claude Code | `claude` | hooks (the plugin has them) | |
+| GitHub Copilot CLI | `copilot` | hooks (the plugin has them) | |
+| Codex | `codex` | hooks, in `~/.codex/hooks.json` | Codex asks you to trust them once: open `/hooks` |
+| Gemini CLI | `gemini` | hooks, in `~/.gemini/settings.json` | |
+| Cursor and `cursor-agent` | `cursor` | hooks, in `~/.cursor/hooks.json` | no "waiting at the computer": Cursor has no hook for a permission prompt that cannot block it |
+| pi | `pi` | an extension pi loads, in `~/.pi/agent/extensions` | restart pi to load it |
+
+Each reports working, idle and gone; all but Cursor also report waiting for you at the computer.
+
+If you run your agents in Herdr, `kabu presence herdr on` adds Herdr's view: every 5 seconds
+the reporter runs `herdr agent list`, and for a session Herdr names by the same session id (Claude Code, Gemini CLI,
+pi), Herdr's working, blocked (waiting at the computer) or idle replaces what the hooks said, unless the hooks said
+something since Herdr looked. Only that state is used;
+nothing else Herdr prints leaves your computer. It is off by default, and `kabu presence herdr off` turns it off.
 
 ## Troubleshooting
 
