@@ -80,15 +80,20 @@ answer.
 
 ## Show session progress
 
+Report progress only when it is measurable (items done of a known total) or for known steps; set `--progress-label` to
+what is counted; never estimate a percentage; otherwise send only a `--headline`. The phone shows exactly what you send:
+`--progress 54/172 --progress-label projects` reads "54 of 172 projects".
+
 ```bash
-kabu session start --title "Migrate billing to v2" --headline "Copying tables" --progress 0/4
+kabu session start --title "Migrate billing to v2" --headline "Copying tables" --progress 0/4 --progress-label tables
 ```
 
 It prints the session: keep its `id` (`ses_…`) and pass it to every later call, as a shell variable may not survive
 between calls.
 
 ```bash
-kabu session update ses_… --headline "Running tests" --progress 2/4
+kabu session update ses_… --headline "Copying tables" --progress 2/4 --progress-label tables
+kabu session update ses_… --headline "Running tests"
 kabu send "Tables copied" "4 of 4 verified" --session ses_…
 kabu session end ses_… --outcome success --summary "PR #12 opened"
 ```
@@ -96,6 +101,12 @@ kabu session end ses_… --outcome success --summary "PR #12 opened"
 `--outcome` is `success`, `failure` or `cancelled`. Messages sent with `--session` group under it in the app. If a
 send prints `session_gone`, that session was deleted with its project: kabu leaves the id out from then on and puts
 later messages in a fresh session, whose id each output gives in `session`.
+
+## Presence
+
+The plugin's hooks tell the app whether this session is working, idle or waiting at the computer: only those states,
+hashed ids, the client's name and the session's project leave the machine. Your `kabu send` and `kabu ask` go in the same session by themselves: do not start one for that.
+`kabu presence status` shows what is reported; if the user wants it off, `kabu presence off` (or `KABU_PRESENCE=0`).
 
 ## Check first
 

@@ -9,6 +9,7 @@ session progress. You need the Kabu app on your iPhone and Python 3.9 or later a
 | `kabu-notify` skill | Teaches the agent when and how to notify and ask, with the `kabu` CLI |
 | `bin/kabu` | The `kabu` CLI: one Python file, standard library only |
 | `kabu` MCP server | `kabu mcp`: Kabu's MCP tools over stdio, signed in with your saved login |
+| Presence, on by default | The app shows whether the agent is working, idle, waiting for you at the computer or gone (`KABU_PRESENCE=0` turns it off) |
 | Hooks, off by default | A push when the agent finishes a turn or needs your input (`KABU_HOOKS=1`) |
 
 ## Install
@@ -92,6 +93,29 @@ off if your agent may print secrets.
 They need a POSIX shell (macOS or Linux). If you already use Kabu's older hooks from `~/.kabu/hooks`, leave
 `KABU_HOOKS` unset to avoid two pushes.
 
+## Presence
+
+On by default. The app shows, on Threads and Agents, whether each agent session is working, idle (ready for a prompt),
+waiting for you at the computer (a permission prompt) or gone. The plugin's hooks write one small file per event in a
+private folder of yours on this computer (in its temp folder); they never read the event, never call the network and
+start no program, so they add about a millisecond to each event. One `kabu presence run` per computer, started by the
+hooks and gone 10 minutes after the last session ends, sends the state about once a minute, and at once when it
+changes.
+
+What leaves your computer: the state (working, idle, waiting at the computer, gone), ids made from a hash (never the
+client's own session id), the client's name (`claude-code`) and the project the session runs in, as `kabu send` already
+sends with every message. Never a prompt, a file path, a tool name, a title or your computer's name. `kabu send` and
+`kabu ask` in the same session go in that session.
+
+| To | Run |
+|---|---|
+| See what it reports | `kabu presence status` |
+| Turn it off on this computer | `kabu presence off` (`kabu presence on` turns it back on) |
+| Turn it off for one agent | Set `KABU_PRESENCE=0` in the environment the agent starts from |
+
+Without the plugin, `kabu presence install --harness claude` (or `--harness copilot`) adds the same hook to the
+client's settings, after a backup; `kabu presence uninstall` takes it out. Use one or the other.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -103,6 +127,7 @@ They need a POSIX shell (macOS or Linux). If you already use Kabu's older hooks 
 | Messages land in another project | The project is the one of the folder the agent session started in, whatever folder a command runs in; `kabu whoami` shows it and, in `project_source`, why. Set `KABU_PROJECT` to choose another |
 | An ask returns exit 20 | It expired unanswered; raise `--expires-in` (default 300 seconds) |
 | No hook pushes | Set `KABU_HOOKS=1` before starting the agent, then restart it |
+| The app shows no presence | `kabu presence status`: `enabled`, a `lanes` entry for the session and `last_beat` without an `error`; log in if it is `missing_api_key` |
 
 `KABU_BASE_URL`, `KABU_PROJECT`, `KABU_AGENT` and `KABU_CONFIG_PATH` override the defaults; see `kabu --help`.
 

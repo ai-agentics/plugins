@@ -6,11 +6,15 @@ Commands:
   kabu ask QUESTION [MESSAGE]   ask and wait for the answer; `kabu --ask "Q?"` does the same
   kabu status MSG_ID            a message as the API has it (--wait N holds while an ask is pending)
   kabu whoami                   what the key can do, and the project and agent kabu would send
-  kabu session start|update|end a session and its Live Activity (--headline, --progress N/M)
+  kabu session start|update|end a session and its Live Activity (--headline, --progress N/M when measured)
   kabu login                    save --api-key KEY, or connect this computer with --device
   kabu mcp                      Kabu's MCP tools on stdin and stdout, for an agent harness to start
   kabu guide                    a copy-paste cheat sheet for coding agents (also: kabu help agents)
   kabu help COMMAND             one command's options and examples (same as kabu COMMAND --help)
+
+Presence (on by default; KABU_PRESENCE=0 or kabu presence off turns it off): kabu presence status shows whether your
+agents are live, as their hooks wrote it on this machine and one kabu presence run reports it; kabu presence install
+--harness claude|copilot adds the hook to a harness's settings (the Kabu plugin has it), and uninstall takes it out.
 
 Output is one JSON object on stdout. An error is one JSON line on stderr, {"error": {"code", "message", "hint"}};
 the hint is the next step, usually a corrected command. Nothing is ever coloured.
@@ -18,16 +22,19 @@ Exit codes: 0 ok (an ask approved, or a choice or text answered), 2 usage or val
 3 network or API error, or an answer kabu does not know, 10 rejected, 20 expired, 21 cancelled or deleted, 130 interrupted.
 Environment: KABU_API_KEY, KABU_BASE_URL (default https://usekabu.com), KABU_PROJECT, KABU_AGENT, KABU_SOURCE,
 KABU_SESSION, KABU_AUTO_SESSION=1 (one session per host, project and agent), KABU_CONFIG_PATH (default
-~/.config/kabu/config.json, written by kabu login, mode 600).
+~/.config/kabu/config.json, written by kabu login, mode 600), KABU_PRESENCE=0 (presence off), KABU_HOME (default
+~/.kabu: presence's reporter identity), KABU_RUNTIME_DIR (default XDG_RUNTIME_DIR or TMPDIR: presence's records).
 """
 from __future__ import annotations
 
 import argparse
+import calendar
 from dataclasses import dataclass, field
 import difflib
 import functools
 import getpass
 import hashlib
+import hmac
 import http.client
 import json
 import mimetypes
@@ -36,6 +43,7 @@ from pathlib import Path
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -43,9 +51,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.4.2"
+VERSION = "2.5.0"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -56,6 +64,15 @@ MAX_RETRY_AFTER = 30.0  # a longer Retry-After fails now rather than block the c
 TITLE_MAX, BODY_MAX = 120, 8192  # MessageCreate maxLength, in characters
 REQUEST_MAX = 64 << 10  # the API's cap on a JSON request, in bytes
 JSON = Dict[str, Any]
+# The type an upload declares, by extension: the container types players open first (AVFoundation will not open
+# audio/mp4a-latm, the codec Python's mimetypes names .m4a on macOS; .aac is raw ADTS, audio/aac), then mimetypes.
+UPLOAD_TYPES = {
+    "m4a": "audio/mp4", "m4b": "audio/mp4", "aac": "audio/aac", "mp4": "video/mp4", "m4v": "video/mp4",
+    "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
+    "webm": "video/webm", "mov": "video/quicktime", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "heic": "image/heic", "pdf": "application/pdf", "md": "text/markdown", "txt": "text/plain",
+    "json": "application/json", "csv": "text/csv",
+}
 
 
 @dataclass
@@ -312,43 +329,64 @@ AGENT_VARIABLES = {"CLAUDECODE": "claude-code", "CLAUDE_CODE_ENTRYPOINT": "claud
                    "PI_CODING_AGENT": "pi"}
 
 
-@functools.lru_cache(maxsize=None)
-def ancestors() -> Tuple[Tuple[int, str, str], ...]:
-    """kabu's ancestor processes, nearest first: process id, start time ("" when unknown) and executable name. Names only:
-    arguments can hold secrets. The start time tells a process from a later one that reuses its id. Linux: /proc, read
+class Proc(NamedTuple):
+    """A process: its parent, start time ("" when unknown: it tells a process from a later one that reuses its id),
+    executable name, and whether it is a zombie (exited, its parent has not reaped it)."""
+
+    ppid: int
+    start: str
+    name: str
+    zombie: bool = False
+
+
+def processes(pids: Optional[Sequence[int]] = None) -> Dict[int, Proc]:
+    """Processes by id: those named, else kabu's ancestors. Names only: arguments can hold secrets. Linux: /proc, read
     with the boot id; elsewhere one ps call, which may not show start times (BusyBox), and names are enough then."""
-    procs: Dict[int, Tuple[int, str, str]] = {}  # pid: (parent pid, start, name)
+    procs: Dict[int, Proc] = {}
     if (PROC / "self" / "stat").exists():
         try:
             boot = (PROC / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
         except OSError:
             boot = ""
-        pid = os.getppid()
-        while pid > 0 and pid not in procs and len(procs) < 32:
+        todo = list(pids) if pids is not None else [os.getppid()]
+        while todo and len(procs) < 32 + len(pids or ()):
+            pid = todo.pop()
+            if pid <= 0 or pid in procs:
+                continue
             try:
                 stat = (PROC / str(pid) / "stat").read_text(errors="replace")
             except OSError:
-                break
+                continue
             rest = stat[stat.rindex(")") + 2:].split()  # the fields after the name, which may hold spaces or parentheses
-            procs[pid] = (int(rest[1]), f"{boot}:{rest[19]}" if boot else "", stat[stat.index("(") + 1:stat.rindex(")")].lower())
-            pid = procs[pid][0]
-    starts = (("pid=,ppid=,lstart=,comm=", r"(\w+ +\w+ +\d+ +[\d:]+ +\d+) +"), ("pid=,ppid=,comm=", "()"))  # with, then without
-    for columns, start in () if procs else starts:
+            procs[pid] = Proc(int(rest[1]), f"{boot}:{rest[19]}" if boot else "", stat[stat.index("(") + 1:stat.rindex(")")].lower(),
+                              rest[0] == "Z")
+            todo += [] if pids is not None else [procs[pid].ppid]
+        return procs
+    which, state = (["-A"], "") if pids is None else (["-p", ",".join(map(str, pids))], "stat=,")  # zombies, for the reporter
+    starts = ((f"pid=,ppid=,{state}lstart=,comm=", r"(\w+ +\w+ +\d+ +[\d:]+ +\d+) +"), (f"pid=,ppid=,{state}comm=", "()"))  # with, then without
+    for columns, start in starts if pids is None or pids else ():
         try:
-            listing = subprocess.run(["ps", "-A", "-o", columns], capture_output=True, text=True, errors="replace", timeout=2,
+            listing = subprocess.run(["ps", *which, "-o", columns], capture_output=True, text=True, errors="replace", timeout=2,
                                      env={**os.environ, "LC_ALL": "C", "TZ": "UTC0"}).stdout  # one format for start times
         except (OSError, subprocess.SubprocessError):
             break
-        rows = re.findall(r"^\s*(\d+)\s+(\d+)\s+" + start + r"(.+)$", listing, re.MULTILINE)
-        procs = {int(pid): (int(ppid), " ".join(when.split()), Path(comm).name.lower()) for pid, ppid, when, comm in rows}
+        rows = re.findall(r"^\s*(\d+)\s+(\d+)\s+" + (r"(\S+)\s+" if state else "()") + start + r"(.+)$", listing, re.MULTILINE)
+        procs = {int(pid): Proc(int(ppid), " ".join(when.split()), Path(comm).name.lower(), flags.startswith("Z"))
+                 for pid, ppid, flags, when, comm in rows}
         if procs:
             break
+    return procs
+
+
+@functools.lru_cache(maxsize=None)
+def ancestors() -> Tuple[Tuple[int, str, str], ...]:
+    """kabu's ancestor processes, nearest first: process id, start time ("" when unknown) and executable name."""
+    procs = processes()
     found: List[Tuple[int, str, str]] = []
     pid = os.getppid()
     while pid in procs and len(found) < 32:
-        ppid, start, name = procs[pid]
-        found.append((pid, start, name))
-        pid = ppid
+        found.append((pid, procs[pid].start, procs[pid].name))
+        pid = procs[pid].ppid
     return tuple(found)
 
 
@@ -455,7 +493,7 @@ class Api:
     def upload(self, path: Path, idem: str) -> str:
         """Upload one file (POST /v2/media/uploads, then PUT the bytes) and return its med_ id."""
         raw = path.read_bytes()
-        ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        ctype = upload_type(path.name)
         up = self.call("POST", "/v2/media/uploads", {"filename": path.name, "content_type": ctype, "size": len(raw),
                                                       "sha256": hashlib.sha256(raw).hexdigest()}, idem=idem)
         media, url = up.get("media") or {}, up.get("upload_url")
@@ -466,6 +504,12 @@ class Api:
             headers = {"Content-Type": ctype, **{k: v for k, v in (up.get("headers") or {}).items() if isinstance(v, str)}}
             self.request("PUT", self.base + url if url.startswith("/") else url, raw, headers, self.timeout)
         return str(media["id"])
+
+
+def upload_type(name: str) -> str:
+    """The Content-Type an upload of the file called name declares: UPLOAD_TYPES, mimetypes, then octet-stream."""
+    ext = name.rpartition(".")[2].lower() if "." in name else ""
+    return UPLOAD_TYPES.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
 def field_pair(cmd: str, item: str) -> JSON:
@@ -596,11 +640,13 @@ MESSAGE = (
     Opt(("--dry-run",), "the API validates it and shows the push and Live Activity text; nothing is sent", kind="flag"),
 ) + CONNECTION
 STATUS = (Opt(("--wait",), "hold up to N seconds, 0 to 50, while an ask is pending", "50", kind="int", bounds=(0, 50)),) + CONNECTION
+PROGRESS_RULE = ("Report progress only when it is measurable (items done of a known total) or for known steps; set\n"
+                 "--progress-label to what is counted; never estimate a percentage; otherwise send only a --headline.")
 SESSION_UPDATE = (
     Opt(("--headline",), "the Live Activity's line, max 80", "Running tests", path="headline", limit=80),
-    Opt(("--progress",), "how far along: N/M, such as 3/8", "3/8", path="progress", pattern=r"\d+(\.\d+)?/(?!0+(\.0*)?$)\d+(\.\d+)?",
+    Opt(("--progress",), "items done of a known total: N/M, such as 54/172; only when measured, never an estimated percentage", "54/172", path="progress", pattern=r"\d+(\.\d+)?/(?!0+(\.0*)?$)\d+(\.\d+)?",
         metavar="N/M", convert=lambda cmd, v: {"value": float(v.split("/")[0]), "total": float(v.split("/")[1])}),
-    Opt(("--progress-label",), "what the progress counts, max 60", "tests", path="progress.label", needs="progress", limit=60, metavar="TEXT"),
+    Opt(("--progress-label",), "what is counted, such as projects, max 60", "projects", path="progress.label", needs="progress", limit=60, metavar="TEXT"),
 )
 SESSION_CREATE = (
     Opt(("--title",), "what the session is for, max 80 (required)", "Fix flaky auth test", path="title", limit=80),
@@ -625,11 +671,18 @@ LOGIN = (
     Opt(("--project", "-p"), "default project to save, max 64", "payments-api", limit=64),
     Opt(("--agent", "-a"), "default agent to save, max 64", "claude-code", limit=64),
 )
+PRESENCE_SETTINGS = (
+    Opt(("--harness",), "the harness whose settings get the hook: claude (Claude Code) or copilot (Copilot CLI)", "claude",
+        choices=("claude", "copilot")),
+    Opt(("--settings",), "its settings file (default: CLAUDE_CONFIG_DIR's or ~/.claude's settings.json; COPILOT_HOME's or "
+        "~/.copilot's)", "~/.claude/settings.json", metavar="PATH"),
+)
 ENV_HELP = "\n\nEnvironment: KABU_API_KEY, KABU_BASE_URL, KABU_PROJECT, KABU_AGENT, KABU_SESSION and more: kabu --help."
 SESSION_ID = ("id", "?", "a ses_… id (default: KABU_SESSION)")
 TEXT_ARG = ("text", "*", "MESSAGE, or TITLE MESSAGE; - reads the message from stdin")
 SAMPLES = {"send": 'send "Build passed"', "ask": 'ask "Deploy to prod?"'}
-NAMES = ("send", "ask", "status", "whoami", "session", "login", "mcp", "guide", "help")
+SUBCOMMAND_SAMPLES = {"session": 'start --title "Fix auth"', "presence": "status"}
+NAMES = ("send", "ask", "status", "whoami", "session", "login", "mcp", "presence", "guide", "help")
 LEGACY = ("daemon", "listen", "service", "steer", "identity", "project")  # kabu.py's commands that kabu does not have
 YES_NO = {("yes", "no"), ("y", "n"), ("approve", "reject")}  # the -c pairs that make a bare --ask kabu.py's yes or no
 RENAMED = {"--check-status": "Use: kabu status MSG_ID", "--progress": "Use: kabu session update --progress 3/8",
@@ -887,11 +940,22 @@ def cmd_message(cmd: str, a: JSON) -> int:
         return emit({"ok": True, "dry_run": True, "request": body, "files": [str(f) for f in files],
                      "preview": api.call("POST", "/v2/messages/preview", body), "project_source": context["project_source"]})
     key = str(uuid.uuid4())  # one Idempotency-Key per invocation: a retry never sends twice
+    joined, folder, lane = presence_join(api) if "session" not in body and not gone else (None, None, "")
+    if joined:
+        body["session"] = joined  # the agent session's own, which its hooks report live
     if "session" not in body and (gone or os.environ.get("KABU_AUTO_SESSION") == "1"):
         auto_session(api, body, key, session_key(harness()) if gone else "")  # a gone session's stand-in: this session's
     if files:
         body["attachments"] = [{"media": api.upload(f, f"{key}-file-{i}")} for i, f in enumerate(files, 1)]
-    msg = api.call("POST", "/v2/messages", body, idem=key)  # an ask waits below, by its id: a 404 there is ask_gone
+    try:
+        msg = api.call("POST", "/v2/messages", body, idem=key)  # an ask waits below, by its id: a 404 there is ask_gone
+    except CliError as e:
+        if not joined or e.code != "session_ended":
+            raise
+        if folder is not None:
+            lane_ended(folder, lane)  # the presence session was ended: the message goes without it, and the next one gets a new one
+        body.pop("session")
+        msg = api.call("POST", "/v2/messages", body, idem=key + "-alone")
     if body.get("session") and msg.get("session", body["session"]) is None:  # the API dropped it: deleted with its project
         gone = body["session"]
         path, known = gone_sessions(api.base)
@@ -1149,6 +1213,803 @@ def cmd_mcp(cmd: str, a: JSON) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------------------------------- presence --
+# Is the agent live? (ADR 021) A hook writes a record at each event of an agent session on this machine; one
+# `kabu presence run` folds them into PUT /v2/presence: a batch a minute, and one at each change. What leaves the
+# machine: state enums, HMAC'd ids, the harness's name and the project the session runs in, as kabu send sends.
+PRESENCE_TICK = 2.0  # seconds between looks at the records and at their harnesses' processes
+PRESENCE_SETTLE = 5.0  # working <-> idle waits this long: a turn that ends as the next one starts sends nothing
+PRESENCE_BEAT = 60  # seconds between batches while nothing changes, unless the API's next_beat_in says otherwise
+PRESENCE_PER_MINUTE = 10  # batches in any 60 s: the API takes 12 a minute from one reporter
+PRESENCE_DECAY = 900.0  # a turn with no event for 15 minutes, and no tool running, reads idle
+PRESENCE_EXIT = 600.0  # kabu presence run exits after 10 minutes with no agent session to report
+PRESENCE_RECHECK = 10.0  # seconds between checks that a harness is no zombie, and still the process that started
+PRESENCE_REPORTS = 20  # the most reports one batch takes
+PRESENCE_FORGET = 300.0  # an exited session that could not be reported offline is dropped after this; its lease lapses
+PRESENCE_TORN = 10.0  # an empty or unreadable record this old is a hook stopped mid-write: removed
+HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd")
+COPILOT_EVENTS = {"SessionStart": "sessionStart", "UserPromptSubmit": "userPromptSubmitted", "PreToolUse": "preToolUse",
+                  "PostToolUse": "postToolUse", "Notification": "notification", "Stop": "agentStop", "SessionEnd": "sessionEnd"}
+NEEDS_INPUT = "permission_prompt|elicitation_dialog|elicitation_url_dialog|worker_permission_prompt|agent_needs_input"
+HOOK_FILE = "presence-hook.sh"  # kabu presence install writes the hook here, in KABU_HOME, and knows its entries by it
+HOOK_CLI = 'kabu_cli="${CLAUDE_PLUGIN_ROOT:-.}/bin/kabu"'  # the plugin's; install puts this CLI's path in its place
+RECORD = re.compile(r"l(\d+)-(\d+)\.json")  # a hook's record: the harness's process id, and the event's seq
+# The hook: a harness's shell sources it in a subshell ((. FILE) || true), so it runs no program of its own, which
+# costs 5 to 10 ms on a Mac. Each event is a new file, created no-clobber (O_EXCL: never through a link, never over
+# another file) at the next free seq, so concurrent hooks never lose one another's events and the order is the seq
+# order. It never reads its input, which a harness may hold open: the session id is Claude Code's CLAUDE_CODE_SESSION_ID
+# (else the harness's process id and start time stand for it), and the Notification matcher picks the types that need
+# the user. scripts/plugin.py writes it to plugins/kabu/hooks/presence.sh.
+PRESENCE_HOOK = r"""# Kabu presence hook for Claude Code and Copilot CLI (ADR 021). Generated by kabu: do not edit.
+# Hook command: kabu_event=EVENT; (. THIS_FILE) || true   It starts no program but the reporter, never reads its
+# input (so it never waits for it), has no unbounded loop, and always exits 0.
+# Each event is a new 0600 record, created no-clobber in this user's machine-local folder (0700, never a link):
+# ${KABU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}/kabu-presence-$USER/l<harness pid>-<seq>.json: the state,
+# the harness's process and session ids and the Herdr pane. Never a prompt, path or tool name, never the network.
+# It starts `kabu presence run`, which reports, when none runs. Off: KABU_PRESENCE=0 or `kabu presence off`.
+kabu_cli="${CLAUDE_PLUGIN_ROOT:-.}/bin/kabu"
+umask 077
+exec 2>/dev/null
+[ "${KABU_PRESENCE:-}" = 0 ] && exit 0
+[ -e "${KABU_HOME:-$HOME/.kabu}/presence/off" ] && exit 0
+kabu_att=null
+case "${kabu_event:-}" in
+  SessionStart|sessionStart) kabu_rt=idle kabu_ev=start ;;
+  UserPromptSubmit|userPromptSubmitted) kabu_rt=working kabu_ev=prompt ;;
+  PreToolUse|preToolUse) kabu_rt=working kabu_ev=tool ;;
+  PostToolUse|postToolUse) kabu_rt=working kabu_ev=post ;;
+  Notification|notification) kabu_rt=working kabu_ev=attention kabu_att='"terminal"' ;;
+  Stop|agentStop) kabu_rt=idle kabu_ev=stop ;;
+  SessionEnd|sessionEnd) kabu_rt=offline kabu_ev=end ;;
+  *) exit 0 ;;
+esac
+kabu_dir=${KABU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}
+kabu_dir="${kabu_dir%/}/kabu-presence-${USER:-${LOGNAME:-}}"
+[ -L "$kabu_dir" ] && exit 0
+[ -d "$kabu_dir" ] || mkdir -m 700 "$kabu_dir" || exit 0
+[ -O "$kabu_dir" ] && [ ! -L "$kabu_dir" ] || exit 0
+kabu_sid=
+[ "${CLAUDE_PID:-}" = "$PPID" ] && kabu_sid=${CLAUDE_CODE_SESSION_ID:-}
+kabu_pane=${HERDR_PANE_ID:-}
+case $kabu_pane in *[!A-Za-z0-9._:-]*) kabu_pane= ;; esac
+[ ${#kabu_pane} -le 40 ] || kabu_pane=
+kabu_put() {
+  case $kabu_sid in *[!A-Za-z0-9._:-]*) kabu_sid= ;; esac
+  [ ${#kabu_sid} -le 64 ] || kabu_sid=
+  kabu_max=0 kabu_n=0
+  for kabu_f in "$kabu_dir"/l"$PPID"-*.json; do
+    kabu_s=${kabu_f##*-}; kabu_s=${kabu_s%.json}
+    case $kabu_s in ''|*[!0-9]*) continue ;; esac
+    kabu_n=$((kabu_n + 1))
+    [ "$kabu_s" -gt "$kabu_max" ] && kabu_max=$kabu_s
+  done
+  [ "$kabu_n" -lt 200 ] || return 0
+  set -C
+  kabu_seq=$kabu_max
+  while [ "$kabu_seq" -lt $((kabu_max + 32)) ]; do
+    kabu_seq=$((kabu_seq + 1))
+    kabu_f="$kabu_dir/l$PPID-$kabu_seq.json"
+    { [ -e "$kabu_f" ] || [ -L "$kabu_f" ]; } && continue
+    printf '%s\n' "{\"v\":2,\"event\":\"$kabu_ev\",\"runtime\":\"$kabu_rt\",\"attention\":$kabu_att,\"seq\":$kabu_seq,\"pid\":$PPID,\"sid\":\"$kabu_sid\",\"pane\":\"$kabu_pane\"}" > "$kabu_f" && return 0
+  done
+}
+kabu_put
+case $kabu_ev in tool|post) exit 0 ;; esac
+kabu_run=0
+[ -f "$kabu_dir/run.pid" ] && [ ! -L "$kabu_dir/run.pid" ] && { IFS= read -r kabu_run < "$kabu_dir/run.pid" || :; }
+case $kabu_run in ''|*[!0-9]*) kabu_run=0 ;; esac
+if [ "$kabu_ev" = start ] || [ "$kabu_run" -le 1 ] || ! kill -0 "$kabu_run"; then
+  (python3 "$kabu_cli" presence run </dev/null >/dev/null 2>&1 &)
+fi
+exit 0
+"""
+
+
+def kabu_home() -> Path:
+    """kabu's state that lasts (KABU_HOME, else ~/.kabu): presence's off switch, reporter identities and the hook."""
+    return Path(os.environ.get("KABU_HOME") or Path.home() / ".kabu")
+
+
+def presence_dir() -> Path:
+    return kabu_home() / "presence"
+
+
+def runtime_dirs() -> List[Path]:
+    """This user's machine-local presence folder, as the hook names it: KABU_RUNTIME_DIR, XDG_RUNTIME_DIR, TMPDIR or
+    /tmp, then kabu-presence-$USER; on a Mac also its per-user temp folder, which a harness may not pass as TMPDIR."""
+    name = "kabu-presence-" + (os.environ.get("USER") or os.environ.get("LOGNAME") or "")
+    base = os.environ.get("KABU_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    found = [Path(base.rstrip("/") or "/") / name]
+    if sys.platform == "darwin" and not os.environ.get("KABU_RUNTIME_DIR"):
+        try:
+            mac = Path(os.confstr("CS_DARWIN_USER_TEMP_DIR") or "") / name
+        except (ValueError, OSError):
+            mac = found[0]
+        found += [mac] if mac.is_absolute() and mac != found[0] else []
+    return found
+
+
+def runtime_dir() -> Path:
+    return runtime_dirs()[0]
+
+
+def own_dir(path: Path, create: bool = False) -> bool:
+    """Whether path is a folder of this user's, never a link, made or set 0700: presence uses no other."""
+    try:
+        if create and not os.path.lexists(path):
+            os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        if st.st_mode & 0o077:
+            os.chmod(path, 0o700)
+    except OSError:
+        return False
+    return True
+
+
+def presence_on() -> bool:
+    """Presence is on unless KABU_PRESENCE=0 or `kabu presence off`."""
+    return os.environ.get("KABU_PRESENCE") != "0" and not os.path.lexists(presence_dir() / "off")
+
+
+def open_dir(path: Path) -> int:
+    """A folder of this user's, opened never through a link: work done in it through this descriptor cannot be sent
+    elsewhere by a link swapped in later."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        raise OSError(f"{path} is not a folder of this user's")
+    return fd
+
+
+def write_private(path: Path, value: Any, keep: bool = False) -> None:
+    """Write JSON (or bytes) as a new 0600 file, never through a link, then put it in place at once: a rename replaces
+    whatever the name was, a link or another file, without writing to it. keep: only if no file is there yet. All of it
+    happens in the folder as opened once (open_dir), so a link swapped in for the folder meanwhile changes nothing."""
+    folder = open_dir(path.parent)
+    tmp = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
+        with os.fdopen(fd, "wb") as out:
+            out.write(value if isinstance(value, bytes) else (json.dumps(value) + "\n").encode())
+        try:
+            if keep:
+                os.link(tmp, path.name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
+            else:
+                os.rename(tmp, path.name, src_dir_fd=folder, dst_dir_fd=folder)
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            os.unlink(tmp, dir_fd=folder)
+        except OSError:
+            pass
+        os.close(folder)
+
+
+def read_private(path: Path, limit: int = 1 << 16) -> Optional[bytes]:
+    """A file of this user's, never through a link (the file's or its folder's), and only a regular one (never a FIFO
+    that would block), or None."""
+    try:
+        folder = open_dir(path.parent)
+    except OSError:
+        return None
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+    except OSError:
+        return None
+    finally:
+        os.close(folder)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > limit:
+            return None
+        return os.read(fd, limit)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def read_json(path: Path) -> JSON:
+    try:
+        value = json.loads((read_private(path) or b"").decode("utf-8", "replace").split("\n", 1)[0])
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def machine_id() -> str:
+    """This machine, which a home shared with others (NFS) does not share: KABU_MACHINE_ID, Linux's machine-id, the
+    Mac's hardware UUID, else the host name. Only its hash names a file."""
+    if os.environ.get("KABU_MACHINE_ID"):
+        return os.environ["KABU_MACHINE_ID"]
+    for name in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            text = Path(name).read_text().strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            uid, wait = ctypes.create_string_buffer(16), (ctypes.c_long * 2)(0, 0)
+            if ctypes.CDLL("/usr/lib/libSystem.B.dylib").gethostuuid(uid, wait) == 0:
+                return uid.raw.hex()
+        except (OSError, AttributeError, ValueError, ImportError):
+            pass
+    return socket.gethostname()
+
+
+def installation(bump: bool = False) -> JSON:
+    """This machine's reporter (ADR 021): its instance id and secret, made once and kept (mode 600), and its restart
+    counter, which bump raises by one, in presence/reporter-<machine>.json (~/.kabu/installation.json is legacy
+    kabu.py's): machines that share a home have their own. The secret never leaves the machine: it keys every HMAC."""
+    if not (own_dir(kabu_home(), create=True) or os.path.isdir(kabu_home())) or not own_dir(presence_dir(), create=True):
+        raise OSError(f"{presence_dir()} is not a folder of this user's (or is a link): presence uses none other")
+    path = presence_dir() / f"reporter-{hashlib.sha256(machine_id().encode()).hexdigest()[:16]}.json"
+    inst = read_json(path)
+    if not (re.fullmatch(r"pin_[0-9A-Za-z]{8,40}", str(inst.get("instance"))) and re.fullmatch(r"[0-9a-f]{64}", str(inst.get("secret")))):
+        fresh = {"instance": "pin_" + uuid.uuid4().hex[:24], "secret": os.urandom(32).hex(), "generation": 0}
+        write_private(path, fresh, keep=not os.path.lexists(path))
+        inst = read_json(path) or fresh
+    inst["generation"] = int(inst.get("generation") or 0)
+    if bump:
+        inst["generation"] += 1
+        write_private(path, inst)
+    inst["path"] = str(path)
+    return inst
+
+
+def keyed(inst: JSON, *parts: str) -> str:
+    """An id that names local things without showing them: HMAC(installation secret, parts), in hex."""
+    return hmac.new(bytes.fromhex(str(inst["secret"])), "\0".join(parts).encode(), hashlib.sha256).hexdigest()
+
+
+def proc_start(token: str) -> Optional[float]:
+    """When a process started, as epoch seconds, from its start token (processes()): a Linux boot id and clock ticks,
+    or ps's lstart in UTC. None when unknown."""
+    try:
+        if ":" in token and " " not in token:
+            btime = next(float(line.split()[1]) for line in (PROC / "stat").read_text().splitlines() if line.startswith("btime "))
+            return btime + int(token.rsplit(":", 1)[1]) / os.sysconf("SC_CLK_TCK")
+        return float(calendar.timegm(time.strptime(token, "%a %b %d %H:%M:%S %Y"))) if token else None
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
+@dataclass
+class Folded:
+    """An agent session's records, folded: the latest event's state and the files that made it."""
+
+    rec: JSON
+    mtime: float
+    files: List[Path]
+
+
+def fold(folder: Path, pid: Optional[int] = None, now: Optional[float] = None) -> Dict[str, Folded]:
+    """Each harness's records in folder, by lane (l<pid>), folded in seq order: the state is the latest event's, the
+    session id the latest one given. A record still empty or unreadable is skipped; one PRESENCE_TORN old (a hook
+    stopped mid-write) is removed when now is given."""
+    lanes: Dict[str, List[Tuple[int, Path, Optional[JSON], float]]] = {}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return {}
+    for name in names:
+        m = RECORD.fullmatch(name)
+        if not m or pid is not None and int(m.group(1)) != pid:
+            continue
+        path = folder / name
+        try:
+            mtime = os.lstat(path).st_mtime
+        except OSError:
+            continue
+        rec = record(path, int(m.group(1)))
+        if rec is None and now is not None and now - mtime > PRESENCE_TORN:
+            unlink(path)
+            continue
+        lanes.setdefault(f"l{m.group(1)}", []).append((int(m.group(2)), path, rec, mtime))
+    out: Dict[str, Folded] = {}
+    for lane, items in lanes.items():
+        valid = sorted((i for i in items if i[2] is not None), key=lambda i: i[0])
+        if not valid:
+            continue
+        rec = dict(valid[-1][2] or {})
+        rec["sid"] = next((str(i[2]["sid"]) for i in reversed(valid) if i[2] and i[2].get("sid")), "")
+        out[lane] = Folded(rec, valid[-1][3], [i[1] for i in items])
+    return out
+
+
+def record(path: Path, pid: int) -> Optional[JSON]:
+    """One hook record, or None while it is being written or when it is not one."""
+    rec = read_json(path)
+    ok = rec.get("pid") == pid and isinstance(rec.get("seq"), int) and rec.get("runtime") in ("working", "idle", "offline") \
+        and rec.get("attention") in (None, "terminal") and isinstance(rec.get("sid", ""), str)
+    return rec if ok else None
+
+
+def seq_of(path: Path) -> int:
+    m = RECORD.fullmatch(path.name)
+    return int(m.group(2)) if m else 0
+
+
+def unlink(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def harness_slug(name: str) -> str:
+    """The agent a harness's process name stands for: claude is claude-code; one kabu does not know, as a slug."""
+    return AGENT_PROCESSES.get(name) or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:64] or "agent"
+
+
+def api_tag(api: Api) -> str:
+    """Which API and key a kept session belongs to: one API's ids mean nothing to another's."""
+    return hashlib.sha256(f"{api.base}\0{api.key}".encode()).hexdigest()[:16]
+
+
+def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start: str, name: str,
+                 timeout: float = 10.0) -> Optional[str]:
+    """The Kabu session of an agent session: the one kept beside its records for this API, else get or create the
+    session whose external_id is HMAC(installation secret, harness ‖ native session id), with no Live Activity. Its
+    title is constant ('<harness> session'), and its project the one the harness's folder names, as kabu send's. The
+    reporter and a kabu send in that agent session so find the same one. None when the API cannot say."""
+    native = str(rec.get("sid") or "") or f"pid:{rec['pid']}:{start}"
+    slug, path = harness_slug(name), folder / f"{lane}.session.json"
+    base = keyed(inst, "session", slug, native)[:40]
+    kept = read_json(path)
+    turn = int(kept.get("round") or 0) if kept.get("id") == base else 0  # a session that ended: the next one
+    if kept.get("api") == api_tag(api) and kept.get("id") == base and str(kept.get("session", "")).startswith("ses_") \
+            and kept["session"] not in gone_sessions(api.base)[1]:
+        return str(kept["session"])
+    try:
+        root = process_cwd(int(rec["pid"]))
+        project = named_project(root.resolve())[0] if root else ""  # never a temp folder's, nor <folder>@<host>
+    except OSError:
+        project = ""
+    body: JSON = {"title": f"{slug} session", "agent": slug, **({"project": project} if project else {})}
+    for n in range(turn, turn + 3):
+        try:
+            got = Api(api.base, api.key, timeout, 0).call("POST", "/v2/sessions", {**body, "external_id": f"kp_{base}" + (f"-{n}" if n else "")},
+                                                          idem=str(uuid.uuid4()))
+        except CliError:
+            return None
+        if isinstance(got.get("id"), str) and got.get("status") not in ("ended", "expired") and not got.get("ended_at"):
+            write_private(path, {"api": api_tag(api), "id": base, "round": n, "session": got["id"]})
+            return str(got["id"])
+    return None
+
+
+def lane_ended(folder: Path, lane: str) -> None:
+    """The API refused a lane's session (ended, or gone): the next one is a new session."""
+    path = folder / f"{lane}.session.json"
+    kept = read_json(path)
+    if kept:
+        write_private(path, {"api": kept.get("api"), "id": kept.get("id"), "round": int(kept.get("round") or 0) + 1})
+
+
+def presence_join(api: Api) -> Tuple[Optional[str], Optional[Path], str]:
+    """The session a kabu send or ask in an agent session that reports presence goes in (CONTRACT.md, Presence), with
+    its folder and lane; None when presence is off, no hook wrote a record for this harness since it started, or the
+    API cannot say."""
+    agent = harness()
+    if agent is None or not presence_on():
+        return None, None, ""
+    lane = f"l{agent[0]}"
+    for folder in runtime_dirs():
+        got = fold(folder, agent[0]).get(lane) if own_dir(folder) else None
+        if got is None:
+            continue
+        started = proc_start(agent[1])
+        if got.rec["runtime"] == "offline" or started is None or got.mtime < started - 1:
+            return None, None, ""  # ended, or records left by an earlier process that had this id
+        try:
+            return lane_session(api, installation(), folder, lane, got.rec, agent[1], agent[2], timeout=3.0), folder, lane
+        except (OSError, ValueError):
+            return None, None, ""
+    return None, None, ""
+
+
+@dataclass
+class Lane:
+    """One agent session as the reporter sees it: its records, its harness's process, and what the API last took."""
+
+    rec: JSON
+    mtime: float
+    start: str
+    name: str
+    checked: float
+    session: Optional[str] = None
+    sent: Optional[Tuple[str, Optional[str]]] = None  # the runtime and attention the API last took
+    want: Optional[Tuple[str, Optional[str]]] = None  # what it should read, since `since`
+    since: float = 0.0
+    gone: float = 0.0  # when its harness exited or its session ended: offline once, then it is forgotten
+
+
+class Reporter:
+    """kabu presence run's state, one step() every PRESENCE_TICK: fold the records, check the harnesses, and send a
+    batch when something changed or a beat is due. `clock` is the wall clock: records carry their file's mtime."""
+
+    def __init__(self, connect: Callable[[], Optional[Api]], inst: JSON, folder: Path, clock: Callable[[], float] = time.time) -> None:
+        self.connect, self.inst, self.folder, self.clock = connect, inst, folder, clock
+        self.lanes: Dict[str, Lane] = {}
+        self.seq = 0
+        self.sent_at: List[float] = []  # when each batch of the last minute went
+        self.next_beat = self.retry_at = 0.0
+        self.failures = 0
+        self.quiet_since = clock()
+        self.status: JSON = {}
+
+    def scan(self, now: float) -> None:
+        """Fold every lane's records and keep only its latest. A new lane is adopted only while its harness runs, is no
+        zombie, and started before its latest record was written: a record older than the process with its id is
+        another process's, left behind."""
+        seen = fold(self.folder, now=now)
+        new = [key for key in seen if key not in self.lanes]
+        info = processes([int(seen[key].rec["pid"]) for key in new]) if new else {}
+        for key in new:
+            first, proc = seen[key], info.get(int(seen[key].rec["pid"]))
+            started = proc_start(proc.start) if proc else None
+            if proc is None or proc.zombie or first.rec["runtime"] == "offline" or started is None or first.mtime < started - 1:
+                self.forget(key, first.files)  # exited, ended or stale before anyone reported it: nothing to say
+                continue
+            self.lanes[key] = Lane(first.rec, first.mtime, proc.start, proc.name, checked=now)
+        for key, lane in self.lanes.items():
+            got = seen.get(key)
+            if got is None:
+                lane.gone = lane.gone or now  # its records were removed: offline
+                continue
+            for path in got.files:  # the latest stays, so the next hook's seq goes on from it
+                if path.name != f"{key}-{got.rec['seq']}.json" and path.name.startswith(key + "-") and record(path, int(got.rec["pid"])):
+                    unlink(path)
+            if got.rec["seq"] != lane.rec["seq"] or got.mtime != lane.mtime:
+                lane.rec, lane.mtime = got.rec, got.mtime
+                if lane.gone and got.rec["runtime"] != "offline" and alive(int(got.rec["pid"])):
+                    lane.gone = 0.0  # the session went on in the same process, as after Claude Code's /clear
+
+    def check(self, now: float) -> None:
+        """A harness whose process exited, is a zombie, or whose id another process took, or whose session ended,
+        reads offline: kill -0 at every look, ps every PRESENCE_RECHECK."""
+        due = {id(lane) for lane in self.lanes.values() if not lane.gone and now - lane.checked >= PRESENCE_RECHECK}
+        info = processes([int(lane.rec["pid"]) for lane in self.lanes.values() if id(lane) in due]) if due else {}
+        for lane in self.lanes.values():
+            if lane.gone:
+                continue
+            dead = not alive(int(lane.rec["pid"])) or lane.rec["runtime"] == "offline"
+            if id(lane) in due:
+                lane.checked = now
+                proc = info.get(int(lane.rec["pid"]))
+                dead = dead or proc is None or proc.zombie or proc.start != lane.start
+            lane.gone = now if dead else 0.0
+
+    def value(self, lane: Lane, now: float) -> Optional[Tuple[str, Optional[str]]]:
+        """What a lane reports in a batch now, or None: what it reads, but the last value taken while working and idle
+        settle, and nothing for an exited session that was never reported or is reported offline already."""
+        if lane.gone:
+            return None if lane.sent in (None, ("offline", None)) else ("offline", None)
+        runtime, attention = str(lane.rec["runtime"]), lane.rec.get("attention")
+        if runtime == "working" and attention is None and lane.rec.get("event") != "tool" and now - lane.mtime > PRESENCE_DECAY:
+            runtime = "idle"  # a turn the hooks lost the end of (an interrupt): no event for 15 minutes, no tool running
+        want = (runtime, attention)
+        if lane.want != want:
+            lane.want, lane.since = want, now
+        settling = lane.sent is not None and {lane.sent[0], runtime} == {"working", "idle"} and lane.sent[1] is None and attention is None
+        return lane.sent if settling and now - lane.since < PRESENCE_SETTLE else want
+
+    def step(self) -> bool:
+        """One look and, when due, one batch. False once the reporter should exit: presence was turned off, or there
+        was no agent session to report for PRESENCE_EXIT."""
+        now = self.clock()
+        on = presence_on() and own_dir(self.folder) and os.path.isdir(kabu_home())  # gone, as a test's folders go: exit
+        self.scan(now)
+        self.check(now)
+        for lane in self.lanes.values():
+            lane.gone = lane.gone or (0.0 if on else now)
+        values = {key: self.value(lane, now) for key, lane in self.lanes.items()}
+        changed = any(v is not None and v != self.lanes[key].sent for key, v in values.items())
+        beat = any(v is not None for v in values.values()) and now >= self.next_beat
+        self.sent_at = [t for t in self.sent_at if now - t < 60]
+        if (changed or beat) and now >= self.retry_at and len(self.sent_at) < PRESENCE_PER_MINUTE:
+            self.send(now, values)
+        for key, lane in list(self.lanes.items()):
+            if lane.gone and (lane.sent in (None, ("offline", None)) or now - lane.gone > PRESENCE_FORGET):
+                pid, got = int(lane.rec["pid"]), fold(self.folder, int(lane.rec["pid"])).get(key)
+                self.forget(key, [p for p in (got.files if got else []) if not alive(pid) or seq_of(p) <= lane.rec["seq"]])
+        if self.lanes:
+            self.quiet_since = now
+        return on and now - self.quiet_since < PRESENCE_EXIT
+
+    def forget(self, key: str, files: Iterable[Path]) -> None:
+        """Drop a lane, the records it was folded from and its session; a record written since stays."""
+        self.lanes.pop(key, None)
+        for path in [*files, self.folder / f"{key}.session.json"]:
+            unlink(path)
+
+    def send(self, now: float, values: Dict[str, Optional[Tuple[str, Optional[str]]]]) -> None:
+        """One batch: every live session of this machine (the API takes a session left out offline), at most 20."""
+        api = self.connect()
+        if api is None:
+            self.status = {**self.status, "error": {"code": "missing_api_key", "at": iso(now)}}
+            self.retry_at = now + PRESENCE_BEAT
+            return
+        reports: List[Tuple[str, Lane, Tuple[str, Optional[str]]]] = []
+        for key, lane in sorted(self.lanes.items(), key=lambda kv: (not kv[1].gone, -kv[1].mtime)):
+            value = values.get(key)
+            if value is None:
+                continue
+            if lane.session is None and not lane.gone:
+                lane.session = lane_session(api, self.inst, self.folder, key, lane.rec, lane.start, lane.name)
+            if lane.session is not None and len(reports) < PRESENCE_REPORTS:
+                reports.append((key, lane, value))
+        if not reports:
+            return
+        self.seq += 1
+        body = {"instance": self.inst["instance"], "generation": self.inst["generation"], "seq": self.seq,
+                "reports": [{"session": lane.session, "lane": "ln_" + keyed(self.inst, "lane", key, lane.start)[:32],
+                             "runtime": value[0], "attention": value[1], "source": "hook"} for key, lane, value in reports]}
+        self.sent_at.append(now)
+        beat: JSON = {"at": iso(now), "generation": body["generation"], "seq": self.seq, "reports": len(reports)}
+        try:
+            ack = Api(api.base, api.key, 10.0, 0).call("PUT", "/v2/presence", body)
+        except CliError as e:
+            self.failures += 1
+            self.retry_at = now + min(PRESENCE_BEAT, 5.0 * 2 ** self.failures)
+            self.status = {**self.status, "last_beat": {**beat, "error": {"code": e.code, "status": e.extra.get("status")}}}
+            return
+        self.failures, self.retry_at = 0, 0.0
+        self.next_beat = now + max(1, int(ack.get("next_beat_in") or PRESENCE_BEAT))
+        results = [r if isinstance(r, dict) else {} for r in ack.get("results") or []]
+        for (key, lane, value), result in zip(reports, results):
+            if result.get("reason") not in ("session_ended", "not_found", "stale"):
+                lane.sent = value  # taken, or fenced by another reporter's lease: sent again at the next beat
+            elif result.get("reason") != "stale":
+                lane_ended(self.folder, key)
+                lane.session, lane.sent = None, None
+                if lane.gone:
+                    lane.sent = ("offline", None)  # nothing left to take offline
+        if any(r.get("reason") == "stale" for r in results):  # this counter was lost or reused: resume above the API's
+            self.inst["generation"] = max(int(ack.get("generation") or 0), int(self.inst["generation"])) + 1
+            self.seq = 0
+            write_private(Path(self.inst["path"]), {k: v for k, v in self.inst.items() if k != "path"})
+            self.retry_at = 0.0
+            self.next_beat = now
+        self.status = {"last_beat": beat, "ack": {k: ack.get(k) for k in ("server_time", "next_beat_in", "generation", "seq",
+                                                                            "expires_at", "results")}}
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # another user's process
+    return True
+
+
+def iso(at: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def presence_run(a: JSON) -> int:
+    """The machine's one reporter: exits at once when another holds the lock, presence is off, its folder is not this
+    user's own (or is a link) or this is no POSIX system; else reports until presence is turned off or no agent session
+    was left for 10 minutes."""
+    folder = runtime_dir()
+    if not presence_on() or not own_dir(folder, create=True):
+        return EXIT_OK
+    try:
+        import fcntl
+    except ImportError:
+        return EXIT_OK
+    try:
+        fd = os.open(folder / "run.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return EXIT_OK  # a link, or not ours to open
+    with os.fdopen(fd, "r+b") as lock:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return EXIT_OK
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return EXIT_OK  # another reporter runs on this machine
+        try:
+            os.setsid()  # outlives the hook that started it
+        except OSError:
+            pass
+        write_private(folder / "run.pid", f"{os.getpid()}\n".encode())
+
+        def connect() -> Optional[Api]:
+            try:
+                return Api.connect(a)  # the key and base URL again each time: kabu login may come later
+            except CliError:
+                return None
+
+        try:
+            inst = installation(bump=True)
+        except OSError:
+            return EXIT_OK
+        reporter, shown = Reporter(connect, inst, folder), None
+        try:
+            while reporter.step():
+                if reporter.status != shown:  # written when it changes, not every tick
+                    write_private(folder / "status.json", reporter.status)
+                    shown = dict(reporter.status)
+                time.sleep(PRESENCE_TICK)
+            write_private(folder / "status.json", reporter.status)
+        finally:
+            if (read_private(folder / "run.pid") or b"").strip() == str(os.getpid()).encode():
+                unlink(folder / "run.pid")
+        del lock
+    return EXIT_OK
+
+
+def presence_status() -> JSON:
+    """What kabu presence status prints: the switch, the reporter, each agent session's state and the last batch."""
+    folder = runtime_dir()
+    lanes = []
+    for key, got in sorted(fold(folder).items()) if own_dir(folder) else ():
+        lanes.append({"lane": key, "runtime": got.rec["runtime"], "attention": got.rec.get("attention"), "event": got.rec.get("event"),
+                      "seq": got.rec["seq"], "pid": got.rec["pid"], "alive": alive(int(got.rec["pid"])), "updated_at": iso(got.mtime),
+                      "session": read_json(folder / f"{key}.session.json").get("session")})
+    run = read_json(folder / "status.json")
+    try:
+        pid = int((read_private(folder / "run.pid") or b"").strip() or 0)
+    except ValueError:
+        pid = 0
+    try:
+        inst = {k: v for k, v in installation().items() if k in ("instance", "generation")}
+    except OSError:
+        inst = {}
+    return {"ok": True, "enabled": presence_on(), "off": os.path.lexists(presence_dir() / "off"),
+            "opted_out": os.environ.get("KABU_PRESENCE") == "0", "running": pid > 1 and alive(pid), "pid": pid if pid > 1 and alive(pid) else None,
+            "instance": inst.get("instance"), "generation": inst.get("generation"), "dir": str(folder), "lanes": lanes,
+            "last_beat": run.get("last_beat"), "ack": run.get("ack")}
+
+
+def settings_file(harness_name: str, given_path: Optional[str]) -> Path:
+    """A harness's user settings: Claude Code's CLAUDE_CONFIG_DIR (~/.claude), Copilot CLI's COPILOT_HOME (~/.copilot)."""
+    if given_path:
+        return Path(os.path.expanduser(given_path))
+    home = os.environ.get("CLAUDE_CONFIG_DIR" if harness_name == "claude" else "COPILOT_HOME")
+    return Path(home or Path.home() / (".claude" if harness_name == "claude" else ".copilot")) / "settings.json"
+
+
+def hook_entries(harness_name: str, hook: Path) -> Dict[str, JSON]:
+    """The hook's entry for each event, under the harness's own name for it: Claude Code's matcher groups, or Copilot
+    CLI's native keys (sessionStart, userPromptSubmitted, …, agentStop) with flat {type, bash, timeoutSec} entries."""
+    entries: Dict[str, JSON] = {}
+    for event in HOOK_EVENTS:
+        name = COPILOT_EVENTS[event] if harness_name == "copilot" else event
+        command = f"kabu_event={name}; [ ! -r {shlex.quote(str(hook))} ] || (. {shlex.quote(str(hook))}) || true"
+        entries[name] = {"type": "command", "bash": command, "timeoutSec": 5} if harness_name == "copilot" else \
+            {**({"matcher": NEEDS_INPUT} if event == "Notification" else {}), "hooks": [{"type": "command", "command": command, "timeout": 5}]}
+    return entries
+
+
+def ours(entry: Any) -> bool:
+    """An entry kabu presence install wrote: its command runs the installed hook."""
+    return HOOK_FILE in json.dumps(entry)
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def backup(path: Path, raw: bytes) -> Path:
+    """A new 0600 copy of a settings file's bytes, beside it, under a name no other backup has."""
+    name = path.with_name(f"{path.name}.bak-kabu-presence-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}-{uuid.uuid4().hex[:6]}")
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(raw)
+    return name
+
+
+def put_settings(path: Path, raw: bytes, mode: int) -> None:
+    """Replace the settings file at once (temp and rename, beside the file a link names), never looser than 0600."""
+    real = path.resolve()
+    tmp = real.with_name(f".{real.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(raw)
+    os.chmod(tmp, mode & 0o600)
+    os.replace(tmp, real)
+
+
+def presence_install(a: JSON, install: bool) -> JSON:
+    """Add the presence hook to a harness's settings, or take it out, after a backup. Install is idempotent; uninstall
+    puts back the exact bytes from before the install when the file is as kabu left it, else takes out only kabu's
+    entries. The hook file goes once no settings use it (presence/installs.json keeps what was installed where)."""
+    path, hook, manifest_path = settings_file(a["harness"], a["settings"]), kabu_home() / HOOK_FILE, presence_dir() / "installs.json"
+    if not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)) or not own_dir(presence_dir(), create=True):
+        raise CliError("unsafe_folder", f"{presence_dir()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
+    try:
+        raw: Optional[bytes] = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        raw, mode = None, 0o600
+    try:
+        settings = json.loads(raw) if raw and raw.strip() else {}
+    except ValueError as exc:
+        raise CliError("invalid_settings", f"{path} is not JSON ({exc}), so kabu left it as it is.", "Fix the file, then run this again.") from None
+    if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
+        raise CliError("invalid_settings", f"{path} has no hooks object kabu can add to.", "Fix the file, then run this again.")
+    manifest = read_json(manifest_path)
+    key, entry = str(path.resolve()), manifest.get(str(path.resolve())) or {}
+    hooks: JSON = {}
+    for event, entries in settings.get("hooks", {}).items():
+        kept = [e for e in entries if not ours(e)] if isinstance(entries, list) else entries
+        if kept != []:
+            hooks[event] = kept
+    saved: List[str] = []
+    if install:
+        write_private(hook, PRESENCE_HOOK.replace(HOOK_CLI, f"kabu_cli={shlex.quote(os.path.abspath(__file__))}", 1).encode())
+        for event, added in hook_entries(a["harness"], hook).items():
+            hooks[event] = [*(hooks.get(event) or []), added]
+        updated = {**settings, "hooks": hooks}
+        new = (json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode()
+        changed = updated != settings
+        if changed:
+            saved += [str(backup(path, raw))] if raw is not None else []
+            put_settings(path, new, mode)
+            manifest[key] = {"harness": a["harness"], "before": entry.get("before", digest(raw) if raw is not None else None),
+                             "backup": entry.get("backup", saved[0] if saved else None), "after": digest(new)}
+    else:
+        changed = raw is not None and (key in manifest or any(ours(e) for v in settings.get("hooks", {}).values() for e in (v if isinstance(v, list) else [])))
+        if changed and raw is not None:
+            saved.append(str(backup(path, raw)))
+            first = read_private(Path(entry["backup"]), 1 << 26) if entry.get("backup") else None
+            if entry and digest(raw) == entry.get("after") and entry.get("before") is None:
+                path.unlink()  # kabu made the file: as kabu left it, it goes
+            elif entry and digest(raw) == entry.get("after") and first is not None and digest(first) == entry.get("before"):
+                put_settings(path, first, mode)  # as kabu left it: the bytes from before, exactly
+            else:  # edited since: only kabu's entries go
+                updated = {**settings, "hooks": hooks}
+                if not hooks and "hooks" not in json.loads(first or b"{}"):
+                    updated.pop("hooks")
+                put_settings(path, (json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode(), mode)
+        manifest.pop(key, None)
+        if not manifest:
+            unlink(hook)
+    write_private(manifest_path, manifest)
+    return {"ok": True, "harness": a["harness"], "settings": str(path), "hook": str(hook), "installed": install,
+            "events": list(hook_entries(a["harness"], hook)) if install else [], "changed": changed,
+            "backup": saved[0] if saved else None}
+
+
+def cmd_presence(cmd: str, a: JSON) -> int:
+    """presence run, status, on, off, install and uninstall (CONTRACT.md, Presence)."""
+    action = cmd.split()[1]
+    check(cmd, COMMANDS[cmd].opts, a)
+    if action == "run":
+        return presence_run(a)
+    if action in ("on", "off"):
+        if not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)) or not own_dir(presence_dir(), create=True):
+            raise CliError("unsafe_folder", f"{presence_dir()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
+        if action == "off":
+            write_private(presence_dir() / "off", {"off": True})
+        else:
+            unlink(presence_dir() / "off")
+    if action in ("install", "uninstall"):
+        if not a["harness"]:
+            raise CliError("missing_flag", f"kabu presence {action} needs --harness claude or copilot.",
+                           f"Example: kabu presence {action} --harness claude")
+        return emit(presence_install(a, action == "install"))
+    return emit(presence_status())
+
+
 @dataclass(frozen=True)
 class Command:
     handler: Callable[[str, JSON], int]
@@ -1178,7 +2039,9 @@ COMMANDS = {
   kabu session start --title "Nightly build" --external-id run-77 --headline "Compiling" --progress 1/4""",
                              SESSION_CREATE + SESSION_UPDATE + CONNECTION),
     "session update": Command(cmd_session, "Update a session's Live Activity. Prints the session.", """\
-  kabu session update --headline "Running tests" --progress 3/8 --progress-label tests""", SESSION_UPDATE + CONNECTION, SESSION_ID),
+  kabu session update --headline "Deleting projects" --progress 54/172 --progress-label projects
+
+{G}""".replace("{G}", PROGRESS_RULE), SESSION_UPDATE + CONNECTION, SESSION_ID),
     "session end": Command(cmd_session, "End a session; its pending asks are cancelled. Prints the session.", """\
   kabu session end --outcome success --summary "PR opened"
   kabu session end ses_01J9Z --outcome failure --dismiss-after 0""", SESSION_END, SESSION_ID),
@@ -1190,6 +2053,23 @@ COMMANDS = {
   claude mcp add kabu -- kabu mcp       Claude Code; the kabu plugin adds it for you
   copilot mcp add kabu -- kabu mcp      GitHub Copilot CLI
   echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | kabu mcp""", CONNECTION),
+    "presence status": Command(cmd_presence, "Print whether presence is on, the reporter, each agent session's record on this "
+                               "machine and the last batch the API took.", """\
+  kabu presence status | jq '.lanes[] | {runtime, session}'""", ()),
+    "presence on": Command(cmd_presence, "Turn presence on again on this machine (it is on by default). Prints the status.", """\
+  kabu presence on""", ()),
+    "presence off": Command(cmd_presence, "Turn presence off on this machine: the hooks write nothing, the reporter takes its "
+                            "sessions offline and exits, and kabu send joins no presence session. Prints the status.", """\
+  kabu presence off                     KABU_PRESENCE=0 does the same for one agent's environment""", ()),
+    "presence run": Command(cmd_presence, "Report this machine's agent sessions to Kabu until none is left for 10 minutes. The "
+                            "hook starts it; a second one exits at once.", """\
+  kabu presence run &""", CONNECTION),
+    "presence install": Command(cmd_presence, "Add the presence hook to a harness's settings, after a backup; running it again "
+                                "changes nothing. Not needed with the Kabu plugin, which has the hook.", """\
+  kabu presence install --harness claude
+  kabu presence install --harness copilot --settings ~/.copilot-work/settings.json""", PRESENCE_SETTINGS),
+    "presence uninstall": Command(cmd_presence, "Take the presence hook out of a harness's settings, after a backup.", """\
+  kabu presence uninstall --harness claude""", PRESENCE_SETTINGS),
 }
 
 
@@ -1198,7 +2078,7 @@ def run(args: List[str]) -> int:
     if not args:
         raise CliError("missing_command", "kabu needs a command or a message.", 'Run: kabu --help, or: kabu send "Build passed"')
     head = args[0]
-    if head in ("-h", "--help") or args[:2] == ["session", "--help"]:
+    if head in ("-h", "--help") or args[:2] in (["session", "--help"], ["presence", "--help"]):
         print(__doc__)
         return EXIT_OK
     if head == "--version":
@@ -1211,13 +2091,14 @@ def run(args: List[str]) -> int:
         if args[1:] and args[1] not in NAMES:
             raise CliError("unknown_command", f"kabu has no {args[1]!r} command.", "Run: kabu --help")
         return run(args[1:] + ["--help"])
-    name = " ".join(args[:2]) if head == "session" else head
+    name = " ".join(args[:2]) if head in ("session", "presence") else head
     if name in COMMANDS:
         return COMMANDS[name].handler(name, parse(name, args[len(name.split()):]))
-    if head == "session":
-        close = difflib.get_close_matches(" ".join(args[1:2]), ("start", "update", "end"), n=1)
-        raise CliError("unknown_command", f"kabu session takes start, update or end, not {' '.join(args[1:2])!r}."
-                       + (f" Did you mean {close[0]!r}?" if close else ""), 'Example: kabu session start --title "Fix auth"')
+    if head in ("session", "presence"):
+        subs = [n.split()[1] for n in COMMANDS if n.startswith(head + " ")]
+        close = difflib.get_close_matches(" ".join(args[1:2]), subs, n=1)
+        raise CliError("unknown_command", f"kabu {head} takes {', '.join(subs[:-1])} or {subs[-1]}, not {' '.join(args[1:2])!r}."
+                       + (f" Did you mean {close[0]!r}?" if close else ""), f"Example: kabu {head} {SUBCOMMAND_SAMPLES[head]}")
     if head in LEGACY:  # never a message: a steering LaunchAgent may still run `kabu.py daemon`
         raise CliError("unknown_command", f"kabu has no {head!r} command: kabu.py's steering ({', '.join(LEGACY[:5])}) and project "
                        "settings are not in kabu.", f"Use the legacy kabu.py 0.2.0 for it. To send the word itself: kabu send {head}")

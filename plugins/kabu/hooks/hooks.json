@@ -1,12 +1,45 @@
 {
   "hooks": {
-    "Stop": [
+    "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${KABU_HOOKS:-}\" != 1 ] || python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/kabu_hook.py\" stop || true",
-            "timeout": 10
+            "command": "kabu_event=SessionStart; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kabu_event=UserPromptSubmit; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kabu_event=PreToolUse; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kabu_event=PostToolUse; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
           }
         ]
       }
@@ -19,6 +52,38 @@
             "type": "command",
             "command": "[ \"${KABU_HOOKS:-}\" != 1 ] || python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/kabu_hook.py\" input || true",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "kabu_event=Notification; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${KABU_HOOKS:-}\" != 1 ] || python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/kabu_hook.py\" stop || true",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "kabu_event=Stop; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kabu_event=SessionEnd; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
           }
         ]
       }
