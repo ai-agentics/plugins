@@ -17,12 +17,15 @@ case "${kabu_event:-}" in
   UserPromptSubmit|userPromptSubmitted|BeforeAgent|beforeSubmitPrompt) kabu_rt=working kabu_ev=prompt ;;
   PreToolUse|preToolUse|BeforeTool) kabu_rt=working kabu_ev=tool ;;
   PostToolUse|postToolUse|AfterTool|postToolUseFailure) kabu_rt=working kabu_ev=post ;;
+  PostToolUseFailure) [ -n "${COPILOT_PLUGIN_ROOT:-}" ] || exit 0; kabu_rt=working kabu_ev=post ;;
   Notification|notification|PermissionRequest) kabu_rt=working kabu_ev=attention kabu_att='"terminal"' ;;
   Stop|agentStop|AfterAgent|Interrupt|stop) kabu_rt=idle kabu_ev=stop ;;
   SessionEnd|sessionEnd) kabu_rt=offline kabu_ev=end ;;
   *) exit 0 ;;
 esac
 case "${kabu_harness:-}" in codex|gemini-cli|cursor) ;; *) kabu_harness= ;; esac
+kabu_copilot=
+case "${kabu_event:-}" in sessionStart) [ -n "$kabu_harness" ] || kabu_copilot=1 ;; SessionStart) [ -z "${COPILOT_PLUGIN_ROOT:-}" ] || kabu_copilot=1 ;; esac
 kabu_dir=${KABU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}
 kabu_dir="${kabu_dir%/}/kabu-presence-${USER:-${LOGNAME:-}}"
 [ -L "$kabu_dir" ] && exit 0
@@ -45,6 +48,11 @@ kabu_put() {
     [ "$kabu_s" -gt "$kabu_max" ] && kabu_max=$kabu_s
   done
   [ "$kabu_n" -lt 200 ] || return 0
+  # Copilot CLI (its own sessionStart, or the plugin it runs) starts a session only at its first prompt, after that
+  # prompt's hook: a start right after a prompt is that turn's, which goes on working.
+  kabu_f="$kabu_dir/l$PPID-$kabu_max.json" kabu_last=
+  [ -n "$kabu_copilot" ] && [ -f "$kabu_f" ] && [ ! -L "$kabu_f" ] && { IFS= read -r kabu_last < "$kabu_f" || :; }
+  case $kabu_last in *'"event":"prompt"'*) return 0 ;; esac
   set -C
   kabu_seq=$kabu_max
   while [ "$kabu_seq" -lt $((kabu_max + 32)) ]; do
