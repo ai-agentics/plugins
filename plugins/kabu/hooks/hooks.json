@@ -44,6 +44,17 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kabu_event=PostToolUseFailure; [ ! -r \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\" ] || (. \"${CLAUDE_PLUGIN_ROOT}/hooks/presence.sh\") || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog|worker_permission_prompt|agent_needs_input",

@@ -56,7 +56,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -944,7 +944,7 @@ def cmd_message(cmd: str, a: JSON) -> int:
         return emit({"ok": True, "dry_run": True, "request": body, "files": [str(f) for f in files],
                      "preview": api.call("POST", "/v2/messages/preview", body), "project_source": context["project_source"]})
     key = str(uuid.uuid4())  # one Idempotency-Key per invocation: a retry never sends twice
-    joined, folder, lane = presence_join(api) if "session" not in body and not gone else (None, None, "")
+    joined, folder, lane = presence_join(api, body.get("agent"), body.get("project")) if "session" not in body and not gone else (None, None, "")
     if joined:
         body["session"] = joined  # the agent session's own, which its hooks report live
     if "session" not in body and (gone or os.environ.get("KABU_AUTO_SESSION") == "1"):
@@ -1299,9 +1299,11 @@ PRESENCE_RECHECK = 10.0  # seconds between checks that a harness is no zombie, a
 PRESENCE_REPORTS = 20  # the most reports one batch takes
 PRESENCE_FORGET = 300.0  # an exited session that could not be reported offline is dropped after this; its lease lapses
 PRESENCE_TORN = 10.0  # an empty or unreadable record this old is a hook stopped mid-write: removed
+PRESENCE_MAKE_RETRY = 15.0  # a Copilot CLI lane whose session the API could not make asks again after this
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd")
 COPILOT_EVENTS = {"SessionStart": "sessionStart", "UserPromptSubmit": "userPromptSubmitted", "PreToolUse": "preToolUse",
-                  "PostToolUse": "postToolUse", "Notification": "notification", "Stop": "agentStop", "SessionEnd": "sessionEnd"}
+                  "PostToolUse": "postToolUse", "PostToolUseFailure": "postToolUseFailure", "Notification": "notification",
+                  "Stop": "agentStop", "SessionEnd": "sessionEnd"}
 # Each harness kabu presence install knows: its agent slug, its settings (the variable naming its folder, the folder
 # under the home, the file) and the hook events it gets, each in the harness's own name, from its current docs (pi has
 # an in-process extension instead: PI_EXTENSION). Cursor gets no preToolUse: a permission hook there blocks the tool
@@ -1312,6 +1314,7 @@ HARNESS_FILES = {"claude": ("CLAUDE_CONFIG_DIR", ".claude", "settings.json"), "c
                  "codex": ("CODEX_HOME", ".codex", "hooks.json"), "gemini": ("", ".gemini", "settings.json"),
                  "cursor": ("", ".cursor", "hooks.json"), "pi": ("PI_CODING_AGENT_DIR", ".pi/agent", "extensions/kabu-presence.js")}
 HARNESS_EVENTS = {
+    "copilot": ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "Stop", "SessionEnd"),
     "codex": ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "Interrupt", "SessionEnd"),
     "gemini": ("SessionStart", "BeforeAgent", "BeforeTool", "AfterTool", "Notification", "AfterAgent", "SessionEnd"),
     "cursor": ("sessionStart", "beforeSubmitPrompt", "postToolUse", "postToolUseFailure", "stop", "sessionEnd"),
@@ -1346,12 +1349,15 @@ case "${kabu_event:-}" in
   UserPromptSubmit|userPromptSubmitted|BeforeAgent|beforeSubmitPrompt) kabu_rt=working kabu_ev=prompt ;;
   PreToolUse|preToolUse|BeforeTool) kabu_rt=working kabu_ev=tool ;;
   PostToolUse|postToolUse|AfterTool|postToolUseFailure) kabu_rt=working kabu_ev=post ;;
+  PostToolUseFailure) [ -n "${COPILOT_PLUGIN_ROOT:-}" ] || exit 0; kabu_rt=working kabu_ev=post ;;
   Notification|notification|PermissionRequest) kabu_rt=working kabu_ev=attention kabu_att='"terminal"' ;;
   Stop|agentStop|AfterAgent|Interrupt|stop) kabu_rt=idle kabu_ev=stop ;;
   SessionEnd|sessionEnd) kabu_rt=offline kabu_ev=end ;;
   *) exit 0 ;;
 esac
 case "${kabu_harness:-}" in codex|gemini-cli|cursor) ;; *) kabu_harness= ;; esac
+kabu_copilot=
+case "${kabu_event:-}" in sessionStart) [ -n "$kabu_harness" ] || kabu_copilot=1 ;; SessionStart) [ -z "${COPILOT_PLUGIN_ROOT:-}" ] || kabu_copilot=1 ;; esac
 kabu_dir=${KABU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}
 kabu_dir="${kabu_dir%/}/kabu-presence-${USER:-${LOGNAME:-}}"
 [ -L "$kabu_dir" ] && exit 0
@@ -1374,6 +1380,11 @@ kabu_put() {
     [ "$kabu_s" -gt "$kabu_max" ] && kabu_max=$kabu_s
   done
   [ "$kabu_n" -lt 200 ] || return 0
+  # Copilot CLI (its own sessionStart, or the plugin it runs) starts a session only at its first prompt, after that
+  # prompt's hook: a start right after a prompt is that turn's, which goes on working.
+  kabu_f="$kabu_dir/l$PPID-$kabu_max.json" kabu_last=
+  [ -n "$kabu_copilot" ] && [ -f "$kabu_f" ] && [ ! -L "$kabu_f" ] && { IFS= read -r kabu_last < "$kabu_f" || :; }
+  case $kabu_last in *'"event":"prompt"'*) return 0 ;; esac
   set -C
   kabu_seq=$kabu_max
   while [ "$kabu_seq" -lt $((kabu_max + 32)) ]; do
@@ -1791,15 +1802,32 @@ def api_tag(api: Api) -> str:
     return hashlib.sha256(f"{api.base}\0{api.key}".encode()).hexdigest()[:16]
 
 
+def ref_key(value: str) -> str:
+    """A project or agent as the API compares them (ProjectRef): lowercase, letters and digits only."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def lane_project(rec: JSON) -> str:
+    """The project the harness's folder names, as kabu send's; never a temp folder's, nor <folder>@<host>."""
+    try:
+        root = process_cwd(int(rec["pid"]))
+        return named_project(root.resolve())[0] if root else ""
+    except OSError:
+        return ""
+
+
 def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start: str, name: str,
-                 timeout: float = 10.0) -> Optional[str]:
+                 timeout: float = 10.0, bind: Optional[Tuple[str, str]] = None) -> Optional[str]:
     """The Kabu session of an agent session: the one kept beside its records for this API, else get or create the
     session whose external_id is HMAC(installation secret, harness ‖ native session id), automatic (ADR 022: it
     claims no run, so it stays idle with no Live Activity of its own). Its
     title is constant ('<harness> session'), and its project the one the harness's folder names, as kabu send's. The
-    reporter and a kabu send in that agent session so find the same one. None when the API cannot say."""
+    reporter and a kabu send in that agent session so find the same one. None when the API cannot say. A Copilot CLI
+    agent session follows the agent and project its messages name (copilot_session); `bind` is for it alone."""
     native = str(rec.get("sid") or "") or f"pid:{rec['pid']}:{start}"
     slug, path = str(rec.get("harness") or "") or harness_slug(name), folder / f"{lane}.session.json"
+    if slug == COPILOT_SLUG:
+        return copilot_session(api, inst, path, rec, slug, native, timeout, bind)
     base = keyed(inst, "session", slug, native)[:40]
     kept = read_json(path)
     turn = int(kept.get("round") or 0) if kept.get("id") == base else 0  # a session that ended: the next one
@@ -1824,31 +1852,80 @@ def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start
     return None
 
 
+# Copilot CLI's agent slug: its sessions, and only its, follow the agent and project their messages name (B33).
+COPILOT_SLUG = AGENT_PROCESSES["copilot"]
+
+
+def copilot_session(api: Api, inst: JSON, path: Path, rec: JSON, slug: str, native: str, timeout: float,
+                    bind: Optional[Tuple[str, str]]) -> Optional[str]:
+    """A Copilot CLI agent session's Kabu session (B33). Copilot sessions name their own agent and project in what they
+    send (`kabu send --agent "Kabu manager" --project …`), and the API rolls presence up by a session's agent, so a
+    send that names an agent or project other than the agent session's own (Copilot CLI, its folder's project; compared
+    as the API does) binds the agent session to them: its session is got or created as that agent in that project
+    (external_id HMAC(… ‖ agent ‖ project), automatic, the same title), kept with the binding, and the
+    reporter and kabu mcp (no `bind`) follow it. A send that names its own agent and project unbinds it. The target is
+    kept before the API is asked, with no session: if the API cannot make it, the reporter takes the old session offline
+    and reports nothing for the agent session (never the agent it was bound to before) until it can (B33 review)."""
+    base = keyed(inst, "session", slug, native)[:40]
+    kept = read_json(path)
+    mine = kept.get("base", kept.get("id")) == base  # kept for this agent session (an older file names only its id)
+    own = str(kept["own"]) if mine and isinstance(kept.get("own"), str) else None
+    if bind is None:
+        held = kept.get("bind") if mine else None
+        target = (str(held[0]), str(held[1])) if isinstance(held, list) and len(held) == 2 else None
+    else:
+        own = lane_project(rec) if own is None else own
+        target = None if (ref_key(bind[0]), ref_key(bind[1])) == (ref_key(slug), ref_key(own)) else bind
+    want = base if target is None else keyed(inst, "session", slug, native, ref_key(target[0]), ref_key(target[1]))[:40]
+    turn = int(kept.get("round") or 0) if kept.get("id") == want else 0  # a session that ended: the next one
+    if kept.get("api") == api_tag(api) and kept.get("id") == want and str(kept.get("session", "")).startswith("ses_") \
+            and kept["session"] not in gone_sessions(api.base)[1]:
+        return str(kept["session"])
+    own = lane_project(rec) if own is None else own
+    entry: JSON = {"api": api_tag(api), "base": base, "id": want, "round": turn, "own": own, **({"bind": list(target)} if target else {})}
+    if kept != entry:
+        write_private(path, entry)  # the target, and no session, before the API is asked: a failure reports nothing
+    agent, project = target if target else (slug, own)
+    body: JSON = {"title": f"{slug} session", "agent": agent, "automatic": True, **({"project": project} if project else {})}
+    for n in range(turn, turn + 3):
+        try:
+            got = Api(api.base, api.key, timeout, 0).call("POST", "/v2/sessions", {**body, "external_id": f"kp_{want}" + (f"-{n}" if n else "")},
+                                                          idem=str(uuid.uuid4()))
+        except CliError:
+            return None
+        if isinstance(got.get("id"), str) and got.get("status") not in ("ended", "expired") and not got.get("ended_at"):
+            write_private(path, {**entry, "round": n, "session": got["id"]})
+            return str(got["id"])
+    return None
+
+
 def lane_ended(folder: Path, lane: str) -> None:
-    """The API refused a lane's session (ended, or gone): the next one is a new session."""
+    """The API refused a lane's session (ended, or gone): the next one is a new session, bound as this one was."""
     path = folder / f"{lane}.session.json"
     kept = read_json(path)
     if kept:
-        write_private(path, {"api": kept.get("api"), "id": kept.get("id"), "round": int(kept.get("round") or 0) + 1})
+        write_private(path, {"api": kept.get("api"), "id": kept.get("id"), "round": int(kept.get("round") or 0) + 1,
+                             **{k: kept[k] for k in ("base", "own", "bind") if k in kept}})
 
 
-def presence_join(api: Api) -> Tuple[Optional[str], Optional[Path], str]:
+def presence_join(api: Api, agent: Optional[str] = None, project: Optional[str] = None) -> Tuple[Optional[str], Optional[Path], str]:
     """The session a kabu send or ask in an agent session that reports presence goes in (CONTRACT.md, Presence), with
     its folder and lane; None when presence is off, no hook wrote a record for this harness since it started, or the
-    API cannot say."""
-    agent = harness()
-    if agent is None or not presence_on():
+    API cannot say. In a Copilot CLI session, the message's own agent and project bind it to them (copilot_session)."""
+    found = harness()
+    if found is None or not presence_on():
         return None, None, ""
-    lane = f"l{agent[0]}"
+    lane = f"l{found[0]}"
     for folder in runtime_dirs():
-        got = fold(folder, agent[0]).get(lane) if own_dir(folder) else None
+        got = fold(folder, found[0]).get(lane) if own_dir(folder) else None
         if got is None:
             continue
-        started = proc_start(agent[1])
+        started = proc_start(found[1])
         if got.rec["runtime"] == "offline" or started is None or got.mtime < started - 1:
             return None, None, ""  # ended, or records left by an earlier process that had this id
         try:
-            return lane_session(api, installation(), folder, lane, got.rec, agent[1], agent[2], timeout=3.0), folder, lane
+            bind = (agent, project or "") if agent else None  # only a Copilot CLI lane follows it (copilot_session)
+            return lane_session(api, installation(), folder, lane, got.rec, found[1], found[2], timeout=3.0, bind=bind), folder, lane
         except (OSError, ValueError):
             return None, None, ""
     return None, None, ""
@@ -1869,6 +1946,8 @@ class Lane:
     since: float = 0.0
     gone: float = 0.0  # when its harness exited or its session ended: offline once, then it is forgotten
     source: str = "hook"  # where what it reads comes from: its records' source, or herdr when Herdr's answer is used
+    kept: float = 0.0  # when its kept session file last changed, as the reporter last read it
+    make_at: float = 0.0  # a Copilot CLI lane whose session the API could not make asks again only from then
 
 
 # The optional Herdr bridge (kabu presence herdr on; ADR 021): Herdr's own view of each agent, from `herdr agent list`
@@ -2000,6 +2079,29 @@ class Reporter:
                 if lane.gone and got.rec["runtime"] != "offline" and alive(int(got.rec["pid"])):
                     lane.gone = 0.0  # the session went on in the same process, as after Claude Code's /clear
         self.lanes.update(retired)
+        for key, lane in list(self.lanes.items()):
+            self.rebound(key, lane, now)
+
+    def rebound(self, key: str, lane: Lane, now: float) -> None:
+        """A Copilot CLI lane whose kept file names another session than the one reported (a send bound it to the agent and
+        project it names, copilot_session), or none (the API could not make that one yet): the old session goes offline
+        once, at the next batch, and the lane reports the kept one, or nothing until the API makes it. Never the old one:
+        a failed switch reports nothing rather than the wrong agent. One stat a look; the file is read only when it
+        changed."""
+        if lane.gone or lane.session is None or (str(lane.rec.get("harness") or "") or harness_slug(lane.name)) != COPILOT_SLUG:
+            return
+        path = self.folder / f"{key}.session.json"
+        try:
+            changed = os.lstat(path).st_mtime
+        except OSError:
+            return
+        if changed == lane.kept:
+            return
+        lane.kept = changed
+        if read_json(path).get("session") != lane.session:
+            self.lanes[f"{key}~{lane.session}"] = Lane(lane.rec, lane.mtime, lane.start, lane.name, now, lane.session, lane.sent, gone=now)
+            lane.session = lane.sent = lane.want = None
+            lane.make_at = 0.0
 
     def check(self, now: float) -> None:
         """A harness whose process exited, is a zombie, or whose id another process took, or whose session ended,
@@ -2102,8 +2204,10 @@ class Reporter:
             value = values.get(key)
             if value is None:
                 continue
-            if lane.session is None and not lane.gone:
+            copilot = (str(lane.rec.get("harness") or "") or harness_slug(lane.name)) == COPILOT_SLUG
+            if lane.session is None and not lane.gone and (not copilot or now >= lane.make_at):
                 lane.session = lane_session(api, self.inst, self.folder, key, lane.rec, lane.start, lane.name)
+                lane.make_at = now + PRESENCE_MAKE_RETRY if copilot and lane.session is None else 0.0
             if lane.session is not None and len(reports) < PRESENCE_REPORTS:
                 reports.append((key, lane, value))
         if not reports:
