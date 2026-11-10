@@ -110,9 +110,13 @@ hashed ids, the client's name and the session's project leave the machine. Your 
 
 ## Check first
 
-- `kabu whoami`: what the key may do, and the project and agent kabu sends as. The project is the one the folder
-  your session started in names, wherever you run kabu, and a scratch folder in `/tmp` never names one;
-  `project_source` says why. Pass `--project`, or set `KABU_PROJECT`, only to send somewhere else.
+- `kabu whoami`: what the key may do, and the project and agent kabu sends as.
+- Never pass `--project`, or set `KABU_PROJECT`, unless the user named a project: kabu names it, the same for every
+  agent, subagent, subfolder and worktree of one piece of work, from the folder your session started in (a `.kabu`
+  file or `KABU_PROJECT` in `.env` there or above it, else a name `kabu project set` gave it or a folder above, else
+  its git repository), wherever you run kabu; a scratch folder in `/tmp` never names one. `kabu project` shows it and
+  `project_source` says why. When `project_source.rule` is `folder` (`<folder>@<host>`), tell the user its `hint`,
+  `kabu project set NAME --dir DIR`, names that workspace once for every agent; never pick a name yourself.
 - `--dry-run` on `send` or `ask`: the API checks it and shows the push; nothing is sent.
 - `kabu COMMAND --help`: every option and its limit.
 
@@ -120,7 +124,7 @@ hashed ids, the client's name and the session's project leave the machine. Your 
 
 The plugin also runs the `kabu` MCP server (`kabu mcp`, with the same login): `notify_human`, `ask_human`,
 `wait_for_human_answer` and `upload_file_for_human`. Use the CLI or the tools for a message, not both. For the tools
-that take a project, `kabu mcp` fills in the one your session's folders name, at each call, unless your key is bound
-to a project; the server names the agent after your client. Pass either only to override it.
+that take a project, `kabu mcp` fills in the one `kabu send` would name, at each call, unless your key is bound to a
+project; the server names the agent after your client. Pass either only when the user names another.
 `ask_human` and `wait_for_human_answer` wait 25 s; to wait until the human replies, pass `max_wait_seconds: 3600`.
 If either still returns an `id`, call `wait_for_human_answer` with it again.

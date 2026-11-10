@@ -6,6 +6,8 @@ Commands:
   kabu ask QUESTION [MESSAGE]   ask and wait for the answer; `kabu --ask "Q?"` does the same
   kabu status MSG_ID            a message as the API has it (--wait N holds while an ask is pending)
   kabu whoami                   what the key can do, and the project and agent kabu would send
+  kabu project                  the project a send here would name, and why (no API call)
+  kabu project set|unset|list   name a folder's project for every agent, subfolder and worktree in it, without a file
   kabu session start|update|end a session and its Live Activity (--headline, --progress N/M when measured)
   kabu login                    save --api-key KEY, or connect this computer with --device
   kabu mcp                      Kabu's MCP tools on stdin and stdout, for an agent harness to start
@@ -23,8 +25,9 @@ Exit codes: 0 ok (an ask approved, or a choice or text answered), 2 usage or val
 3 network or API error, or an answer kabu does not know, 10 rejected, 20 expired, 21 cancelled or deleted, 130 interrupted.
 Environment: KABU_API_KEY, KABU_BASE_URL (default https://usekabu.com), KABU_PROJECT, KABU_AGENT, KABU_SOURCE,
 KABU_SESSION, KABU_AUTO_SESSION=1 (an automatic session per host, project and agent), KABU_CONFIG_PATH (default
-~/.config/kabu/config.json, written by kabu login, mode 600), KABU_PRESENCE=0 (presence off), KABU_HOME (default
-~/.kabu: presence's reporter identity), KABU_RUNTIME_DIR (default XDG_RUNTIME_DIR or TMPDIR: presence's records).
+~/.config/kabu/config.json, written by kabu login, mode 600; kabu project set writes projects.json beside it),
+KABU_PRESENCE=0 (presence off), KABU_HOME (default ~/.kabu: presence's reporter identity), KABU_RUNTIME_DIR (default
+XDG_RUNTIME_DIR or TMPDIR: presence's records).
 """
 from __future__ import annotations
 
@@ -56,7 +59,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -120,11 +123,12 @@ def load_config() -> JSON:
     return data if isinstance(data, dict) else {}
 
 
-def save_config(cfg: JSON) -> Path:
-    """Write the config with mode 600 from the first byte: the key never sits in a readable file."""
-    path = default_config_path()
+def save_config(cfg: JSON, path: Optional[Path] = None) -> Path:
+    """Write the config (or the project map, at `path`) with mode 600 from the first byte: the key never sits in a
+    readable file."""
+    path = path or default_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as out:
         out.write(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
     os.chmod(tmp, 0o600)
@@ -149,6 +153,7 @@ def base_url(flag: Optional[str], cfg: JSON) -> str:
 
 
 PROJECT_ENV_KEYS = ("KABU_PROJECT", "AGENT_NOTIFIER_PROJECT")
+ANCHORS = (".kabu", ".env.local", ".env")  # a folder's anchors, in order: kabu's own file, then .env.local before .env
 TEMP_DIRS = tuple({Path(d).resolve() for d in ("/tmp", "/var/tmp", "/var/folders", os.environ.get("TMPDIR") or "/tmp")})
 KEPT_DAYS = 7  # an agent session's kept project is removed once unused this long
 PROC = Path("/proc")  # Linux's process files
@@ -162,37 +167,196 @@ def _git(cwd: Path, *args: str) -> str:
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
-def _read_dotenv_project(path: Path) -> str:
-    """KABU_PROJECT, else AGENT_NOTIFIER_PROJECT, from one .env file (export, quotes and trailing comments allowed)."""
+def _unquoted(val: str) -> str:
+    """A value as an .env or .kabu line gives it: in quotes ('…' or "…"), else up to a trailing # comment."""
+    if val[:1] in ("'", '"'):
+        end = val.find(val[0], 1)
+        return val[1:end] if end > 0 else val[1:]
+    return val.split(" #", 1)[0].strip()
+
+
+def _anchor(path: Path) -> str:
+    """The project an anchor file names: a .kabu file's `project = NAME` (or a JSON {"project": NAME}), an .env file's
+    KABU_PROJECT, else AGENT_NOTIFIER_PROJECT (export, quotes and trailing comments allowed). "" for none, and for
+    anything but a regular file, read without blocking: ~/.kabu is kabu's own folder."""
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return ""
+    try:
+        text = os.read(fd, 1 << 20).decode("utf-8", "replace") if stat.S_ISREG(os.fstat(fd).st_mode) else ""
+    except OSError:
+        text = ""
+    finally:
+        os.close(fd)
+    if path.name == ANCHORS[0] and text.lstrip().startswith("{"):
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return ""
+        name = doc.get("project") if isinstance(doc, dict) else None
+        return name.strip() if isinstance(name, str) else ""
     found: Dict[str, str] = {}
-    for raw in lines:
+    for raw in text.splitlines():
         line = raw.strip()
         key, sep, val = (line[7:].lstrip() if line.startswith("export ") else line).partition("=")
-        key, val = key.strip(), val.strip()
-        if line.startswith("#") or not sep or key not in PROJECT_ENV_KEYS:
-            continue
-        if val[:1] in ("'", '"'):
-            end = val.find(val[0], 1)
-            val = val[1:end] if end > 0 else val[1:]
-        else:
-            val = val.split(" #", 1)[0].strip()
-        if val:
-            found[key] = val
-    return next((found[k] for k in PROJECT_ENV_KEYS if found.get(k)), "")
+        key, val = key.strip(), _unquoted(val.strip())
+        if not line.startswith("#") and sep and val and key in (("project",) if path.name == ANCHORS[0] else PROJECT_ENV_KEYS):
+            found[key] = val  # the last of each, as a shell reads them
+    return next((found[k] for k in ("project", *PROJECT_ENV_KEYS) if found.get(k)), "")
 
 
-def _git_roots(cwd: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    """Return (this worktree's top level, the main worktree's top level)."""
-    top = _git(cwd, "rev-parse", "--show-toplevel")
-    if not top:
-        return None, None
-    common = _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    main = Path(common).parent if common and Path(common).name == ".git" else Path(top)
-    return Path(top).resolve(), main.resolve()
+def _repo(folder: Path, memo: JSON) -> Tuple[Optional[Path], Optional[Path]]:
+    """The folder's worktree top and its main worktree's top, (None, None) outside a git repository: one git call, which
+    memo keeps (an agent session keeps it in its cache file, Project resolution). Never --path-format, which git learned
+    in 2.31: an older one (Debian 11's, Ubuntu 20.04's) prints an option it does not know back, and exits 0. So the
+    common dir, relative to the folder unless absolute, is read against it, and a line that starts with - names none."""
+    key = str(folder)
+    if key not in memo:
+        lines = _git(folder, "rev-parse", "--show-toplevel", "--git-common-dir").splitlines()
+        common = (folder / lines[1]).resolve() if len(lines) == 2 and not any(line.startswith("-") for line in lines) else None
+        memo[key] = [str(Path(lines[0]).resolve()), str((common.parent if common.name == ".git" else Path(lines[0])).resolve())] \
+            if common is not None else None
+    got = memo[key]
+    return (Path(got[0]), Path(got[1])) if isinstance(got, list) and len(got) == 2 else (None, None)
+
+
+def _repo_name(folder: Path, main: Path, memo: JSON) -> str:
+    """The repository's name: the origin remote's, else the main worktree's folder name; memo keeps it, as _repo's facts."""
+    key = f"name:{main}"
+    if not isinstance(memo.get(key), str):
+        url = _git(folder, "config", "--get", "remote.origin.url").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        memo[key] = (url[:-4] if url.endswith(".git") else url) or main.name
+    return str(memo[key])
+
+
+def _chain(folder: Path, top: Optional[Path], main: Optional[Path]) -> List[Path]:
+    """The folders whose anchors and map entries may name `folder`, nearest first: up to the home folder (outside it, up to
+    the folder under /), across git repositories. A linked worktree's own come first, up to the first its main worktree's
+    share (a temp worktree's, up to its top), then the main worktree's."""
+    home = Path(os.path.expanduser("~")).resolve()
+
+    def up(start: Path) -> List[Path]:
+        found: List[Path] = []
+        for d in (start, *start.parents):
+            if d.parent == d:
+                break  # never / itself
+            found.append(d)
+            if d == home:
+                break
+        return found
+
+    if top is None or main is None or main == top:
+        return up(folder)
+    theirs, own = up(main), []
+    for d in up(folder):
+        if d in theirs:
+            break
+        own.append(d)
+        if d == top and is_temp(folder):
+            break
+    return own + theirs
+
+
+def map_path() -> Path:
+    """The project map, folder to name (kabu project set): projects.json beside the config file."""
+    return default_config_path().with_name("projects.json")
+
+
+def project_map(strict: bool = False) -> Dict[str, str]:
+    """The project map's entries, absolute folder to name. One that is not a JSON object of them reads as none, or,
+    strict (kabu project set and unset), is refused: kabu never rewrites what it cannot read."""
+    path = map_path()
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        doc = None
+    entries = {k: v.strip() for k, v in doc.items() if os.path.isabs(k) and isinstance(v, str) and v.strip()} if isinstance(doc, dict) else {}
+    if isinstance(doc, dict) and len(entries) == len(doc):
+        return entries
+    if strict:
+        raise CliError("invalid_map", f"{path} is not a JSON object of absolute folder to project name, so kabu left it as it is.",
+                       "Fix it or move it away, then run this again.")
+    return {}
+
+
+def named_project(folder: Path, memo: Optional[JSON] = None) -> Tuple[str, JSON]:
+    """The project a folder names, and how (project_source's via, file and prefix; CONTRACT.md, What a folder names): an
+    anchor, nearest first, then the project map's nearest entry, then the git repository's name. ("", {}) when it names
+    none, as a missing folder, or a temp one but a worktree of a repository whose main worktree is outside the temp
+    folders. `memo` keeps git's answers."""
+    memo = {} if memo is None else memo
+    if not folder.is_dir():
+        return "", {}
+    top, main = _repo(folder, memo)
+    if is_temp(folder) and (main is None or is_temp(main)):
+        return "", {}
+    chain = _chain(folder, top, main)
+    for d in chain:
+        for name in ANCHORS:
+            found = _anchor(d / name)
+            if found:
+                return found, {"via": "kabu" if name == ANCHORS[0] else "dotenv", "file": str(d / name)}
+    mapped = project_map()
+    nodes: Optional[Dict[Tuple[int, int], str]] = None
+    for d in chain if mapped else ():
+        key = str(d) if str(d) in mapped else None
+        if key is None:  # an entry written another way (by hand, in another case, through a link): the same device and inode
+            nodes = map_nodes(mapped) if nodes is None else nodes
+            here = node(d)
+            key = nodes.get(here) if here is not None else None
+        if key is not None:
+            return mapped[key], {"via": "map", "file": str(map_path()), "prefix": key}
+    return (_repo_name(folder, main, memo), {"via": "git"}) if main is not None else ("", {})
+
+
+def on_disk(folder: Path) -> Path:
+    """A folder's path as the system names it to a process working there: links resolved and, on a Mac, each name in its
+    disk's case (fcntl F_GETPATH), which Path.resolve leaves as typed: --dir ~/Work/CTF is ~/work/ctf, the folder an
+    agent there has. One kabu cannot open, or no folder: resolve's."""
+    real = folder.resolve()
+    if sys.platform != "darwin":
+        return real
+    import fcntl
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return real
+    try:
+        named = os.fsdecode(fcntl.fcntl(fd, getattr(fcntl, "F_GETPATH", 50), bytes(1024)).split(b"\0", 1)[0])  # MAXPATHLEN
+    except OSError:
+        named = ""
+    finally:
+        os.close(fd)
+    return Path(named) if named.startswith("/") else real
+
+
+def node(path: Path) -> Optional[Tuple[int, int]]:
+    """A folder's device and inode, the same by every path to it (another case on a Mac, a link); None for no folder."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):  # gone, out of reach, or a name with a NUL in it
+        return None
+    return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
+
+
+def map_nodes(mapped: Mapping[str, str]) -> Dict[Tuple[int, int], str]:
+    """The map's entries whose folders exist, by device and inode: the first entry of each folder."""
+    nodes: Dict[Tuple[int, int], str] = {}
+    for key in mapped:
+        found = node(Path(key))
+        if found is not None:
+            nodes.setdefault(found, key)
+    return nodes
+
+
+def map_entries(entries: Mapping[str, str], folder: Path) -> List[str]:
+    """The map's entries that name `folder`: its path's, then, while it is a folder, any that name it another way."""
+    here = node(folder)
+    others = [k for k in entries if k != str(folder) and node(Path(k)) == here] if here is not None else []
+    return ([str(folder)] if str(folder) in entries else []) + others
 
 
 def is_temp(folder: Path) -> bool:
@@ -200,69 +364,102 @@ def is_temp(folder: Path) -> bool:
     return any(folder == d or d in folder.parents for d in TEMP_DIRS)
 
 
-def named_project(folder: Path) -> Tuple[str, str]:
-    """The project a folder names, and how: KABU_PROJECT in .env.local or .env from the folder up to its repository's top,
-    then the main worktree's ("dotenv"); else the git repository's name ("git"). ("", "") when it names none, as a temp
-    folder does unless it is a worktree of a repository whose main worktree is outside the temp folders."""
-    top, main = _git_roots(folder)
-    if is_temp(folder) and (main is None or is_temp(main)):
-        return "", ""
-    dirs = [folder]  # from here up to the repository's top, then the main worktree's
-    while top is not None and dirs[-1] != top and dirs[-1].parent != dirs[-1]:
-        dirs.append(dirs[-1].parent)
-    if main is not None and main not in dirs:
-        dirs.append(main)
-    for d in dirs:
-        for name in (".env.local", ".env"):
-            found = _read_dotenv_project(d / name)
-            if found:
-                return found, "dotenv"
-    if main is None:
-        return "", ""
-    name = _git(folder, "config", "--get", "remote.origin.url").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-    return (name[:-4] if name.endswith(".git") else name) or main.name, "git"
-
-
-def resolve_project(cwd: Optional[Path] = None) -> Tuple[Optional[str], JSON]:
+def resolve_project(cwd: Optional[Path] = None, lane: Optional[Tuple[int, str, str]] = None,
+                    alone: bool = False) -> Tuple[Optional[str], JSON]:
     """The project to send without --project (None: the API picks), and the rule that named it (CONTRACT.md, Project
-    resolution): the environment, the agent session's root, what the session kept, this folder, the login, a name."""
+    resolution): the environment, the agent session's root, the folder its first call named, this folder, the login, the
+    root's folder. `lane`, an agent session's harness: as a kabu send in it resolves, from the harness's own environment
+    and with no current folder (presence). `alone`: as a command in `cwd` outside any agent session (kabu project)."""
+    env: Mapping[str, str] = os.environ if lane is None else process_env(lane[0]) or {}
     for k in PROJECT_ENV_KEYS:
-        if os.environ.get(k, "").strip():
-            return os.environ[k].strip(), {"rule": "env", "variable": k}
-    agent = harness()
+        if env.get(k, "").strip():
+            return env[k].strip(), {"rule": "env", "variable": k}
+    agent = lane if lane is not None or alone else harness()
     seen: JSON = {"harness": agent[2]} if agent else {}
-    variable = {"variable": "CLAUDE_PROJECT_DIR"} if os.environ.get("CLAUDE_PROJECT_DIR") else {}
-    found = Path(os.environ["CLAUDE_PROJECT_DIR"]) if variable else process_cwd(agent[0]) if agent else None
+    variable = {"variable": "CLAUDE_PROJECT_DIR"} if env.get("CLAUDE_PROJECT_DIR") and not alone else {}
+    found = Path(env["CLAUDE_PROJECT_DIR"]) if variable else process_cwd(agent[0]) if agent else None
     root = str(found.resolve()) if found else ""
     kept = cache_dir() / "sessions" / f"{session_key(agent)}.json" if session_key(agent) else None
-    if kept is not None:
-        try:
-            entry = json.loads(kept.read_text(encoding="utf-8"))
-            if entry["root"] == root:  # read back while the root is the folder it was named under; moved, resolve again
-                kept.touch()  # in use: kept for another KEPT_DAYS
-                return str(entry["project"]), {**entry["source"], "cached": True}
-        except (OSError, ValueError, KeyError, TypeError):
-            pass  # not kept yet, or unreadable: resolve again
+    entry: JSON = {}
+    try:  # the session's kept file, read only while its root is the folder it was kept under; moved, resolve again
+        got = json.loads(kept.read_text(encoding="utf-8")) if kept is not None else {}
+        entry = got if isinstance(got, dict) and got.get("root") == root else {}
+    except (OSError, ValueError):
+        pass  # not kept yet, or unreadable: resolve again
+    memo: JSON = dict(entry["git"]) if isinstance(entry.get("git"), dict) else {}  # git's answers, asked once a session
+    held: JSON = entry["source"] if isinstance(entry.get("source"), dict) else {}
     folders = [("session_root", Path(root))] if root else []
-    try:
-        folders.append(("cwd", (cwd or Path.cwd()).resolve()))
-    except OSError:
-        pass  # the current folder was removed: it names nothing, and the root may still
+    if held.get("rule") == "cwd" and isinstance(held.get("dir"), str):
+        folders.append(("cwd", Path(held["dir"])))  # rule 3: the folder this session's first rule 4 named, while it names one
+    here: Optional[Path] = None
+    if lane is None:
+        try:
+            here = (cwd or Path.cwd()).resolve()
+            folders.append(("cwd", here))
+        except OSError:
+            pass  # the current folder was removed: it names nothing, and the root may still
     for rule, folder in folders:
-        name, via = named_project(folder)
-        if name:
-            source = {"rule": rule, **seen, "dir": str(folder), "via": via, **(variable if rule == "session_root" else {})}
-            if kept is not None:  # for the session's later calls; files no session used for KEPT_DAYS go
-                write_cache(kept, json.dumps({"project": name, "source": source, "root": root}), time.time() - KEPT_DAYS * 86400)
-            return name, source
+        name, how = named_project(folder, memo)
+        if not name:
+            continue
+        source = {"rule": rule, **seen, "dir": str(folder), **how, **(variable if rule == "session_root" else {})}
+        same = entry.get("project") == name and entry.get("source") == source  # anchors and the map, read again: still so
+        if kept is not None and (not same or entry.get("git") != memo):  # for the session's later calls; files no session
+            write_cache(kept, json.dumps({"project": name, "source": source, "root": root, "git": memo}),  # used for KEPT_DAYS go
+                        time.time() - KEPT_DAYS * 86400)
+        elif kept is not None:
+            try:
+                kept.touch()  # in use: kept for another KEPT_DAYS
+            except OSError:
+                pass
+        return name, {**source, "cached": True} if same else source
     saved = load_config().get("project")
     if isinstance(saved, str) and saved.strip():
         return saved.strip(), {"rule": "login", **seen}
     home, host = Path(os.path.expanduser("~")).resolve(), socket.gethostname().split(".", 1)[0] or "host"
-    for rule, folder in folders:  # never a name for /, the home folder, a missing folder (Linux: "… (deleted)") or a temp one
-        if folder.parent != folder and folder != home and folder.is_dir() and not is_temp(folder):
-            return f"{folder.name}@{host}", {"rule": "folder", **seen, "dir": str(folder)}
+    last = Path(root) if root else here if agent is None else None  # an agent session's root, never a folder it moved to
+    if last is not None and last.parent != last and last != home and last.is_dir() and not is_temp(last):  # never /, home,
+        return f"{last.name}@{host}", {"rule": "folder", **seen, "dir": str(last), "hint": (  # a missing or a temp folder
+            "Name this workspace once, for every agent, subfolder and worktree in it: kabu project set NAME --dir "
+            + shlex.quote(str(last)))}
     return None, {"rule": "default", **seen}
+
+
+LANE_VARIABLES = (*PROJECT_ENV_KEYS, "CLAUDE_PROJECT_DIR", "COPILOT_HOME")  # all kabu reads of another process's environment
+
+
+def process_env(pid: int) -> Optional[Dict[str, str]]:
+    """LANE_VARIABLES as a process's environment has them, or None when kabu cannot read it (gone, another user's, or on
+    macOS a system program's, whose environment is withheld): /proc on Linux; on macOS sysctl's KERN_PROCARGS2, its
+    arguments first, skipped. Only these are kept: the rest, as the arguments, can hold secrets."""
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+            libc, size, most = ctypes.CDLL("/usr/lib/libSystem.B.dylib"), ctypes.c_size_t(4), ctypes.c_int(0)
+            if libc.sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(most), ctypes.byref(size), None, 0) != 0:  # KERN_ARGMAX
+                return None
+            buf, size = ctypes.create_string_buffer(most.value), ctypes.c_size_t(most.value)
+            if libc.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buf, ctypes.byref(size), None, 0) != 0:  # KERN_PROCARGS2
+                return None
+            raw = buf.raw[:size.value]
+            argc, parts, at = int.from_bytes(raw[:4], sys.byteorder), raw[4:].split(b"\0"), 1
+            while at < len(parts) and not parts[at]:
+                at += 1  # the executable's path, then the padding before the arguments
+            items = parts[at + argc:]
+            if not any(items):
+                return None  # its environment withheld, as a system program's is: not even the kernel's own strings follow
+        else:
+            items = (PROC / str(pid) / "environ").read_bytes().split(b"\0")
+    except (OSError, ValueError, ImportError, AttributeError):  # gone, another user's, or a Python without ctypes
+        return None
+    found: Dict[str, str] = {}
+    for item in items:
+        if not item:
+            break  # the end of the environment
+        key, sep, value = item.partition(b"=")
+        if sep and key.decode("ascii", "replace") in LANE_VARIABLES:
+            found[key.decode("ascii")] = value.decode("utf-8", "replace")
+    return found
 
 
 def harness() -> Optional[Tuple[int, str, str]]:
@@ -323,9 +520,10 @@ def process_cwd(pid: int) -> Optional[Path]:
         return None
 
 
-# Process names of agent harnesses, looked for among kabu's ancestors.
-AGENT_PROCESSES = {"claude": "claude-code", "copilot": "copilot-cli", "codex": "codex", "cursor-agent": "cursor", "gemini": "gemini-cli",
-                   "opencode": "opencode", "aider": "aider", "goose": "goose", "amp": "amp", "pi": "pi"}
+# Process names of agent harnesses, looked for among kabu's ancestors: copilot-runtime is the Copilot app's Copilot CLI.
+AGENT_PROCESSES = {"claude": "claude-code", "copilot": "copilot-cli", "copilot-runtime": "copilot-cli", "codex": "codex",
+                   "cursor-agent": "cursor", "gemini": "gemini-cli", "opencode": "opencode", "aider": "aider", "goose": "goose",
+                   "amp": "amp", "pi": "pi"}
 # Variables harnesses set for the commands they run; never their configuration, such as CODEX_HOME.
 AGENT_VARIABLES = {"CLAUDECODE": "claude-code", "CLAUDE_CODE_ENTRYPOINT": "claude-code", "CURSOR_AGENT": "cursor",
                    "CURSOR_TRACE_ID": "cursor", "GEMINI_CLI": "gemini-cli", "CODEX_THREAD_ID": "codex", "CODEX_SANDBOX": "codex",
@@ -592,7 +790,7 @@ CONNECTION = (
     Opt(("--timeout",), "seconds to wait for each response, 1 to 600 (default 30)", "30", kind="float", bounds=(1, 600), metavar="SECONDS"),
     Opt(("--json",), "ignored: kabu always prints one JSON object (kabu.py's flag)", kind="flag"),
 )
-PROJECT = Opt(("--project", "-p"), "project, max 64 (default: KABU_PROJECT, else your agent session's repo: see kabu whoami)",
+PROJECT = Opt(("--project", "-p"), "project, max 64 (default: KABU_PROJECT, else what your agent session's folder names: see kabu project)",
               "payments-api", path="project", limit=64)
 AGENT = Opt(("--agent", "-a"), "agent, max 64 (default: KABU_AGENT, the login's, the harness)", "claude-code", path="agent", limit=64,
             default=resolve_agent)
@@ -677,17 +875,24 @@ LOGIN = (
 PRESENCE_SETTINGS = (
     Opt(("--harness",), "the harness whose settings get the hook: claude (Claude Code), copilot (Copilot CLI), codex, gemini "
         "(Gemini CLI), cursor (Cursor and its CLI) or pi (an extension)", "claude", choices=("claude", "copilot", "codex", "gemini", "cursor", "pi")),
-    Opt(("--settings",), "its settings file (default: CLAUDE_CONFIG_DIR's or ~/.claude's settings.json; COPILOT_HOME's or "
-        "~/.copilot's; CODEX_HOME's or ~/.codex's hooks.json; ~/.gemini/settings.json; ~/.cursor/hooks.json; "
-        "PI_CODING_AGENT_DIR's or ~/.pi/agent's extensions/kabu-presence.js)", "~/.claude/settings.json", metavar="PATH"),
+    Opt(("--settings",), "its settings file (default: CLAUDE_CONFIG_DIR's or ~/.claude's settings.json; every Copilot "
+        "home's: COPILOT_HOME, ~/.copilot, each ~/.copilot-* with a settings.json or config.json; CODEX_HOME's or ~/.codex's "
+        "hooks.json; ~/.gemini/settings.json; ~/.cursor/hooks.json; PI_CODING_AGENT_DIR's or ~/.pi/agent's "
+        "extensions/kabu-presence.js)", "~/.claude/settings.json", metavar="PATH"),
 )
+PROJECT_SET = (
+    Opt(("--dir",), "the folder (default: the main worktree's top of this folder's repository, else your agent session's "
+        "root, else this folder)", "~/work/ctf", metavar="DIR"),
+    CONNECTION[3],
+)
+PROJECT_SHOW = (Opt(("--dir",), "what a command in DIR outside an agent session would name", "~/work/ctf", metavar="DIR"), CONNECTION[3])
 ENV_HELP = "\n\nEnvironment: KABU_API_KEY, KABU_BASE_URL, KABU_PROJECT, KABU_AGENT, KABU_SESSION and more: kabu --help."
 SESSION_ID = ("id", "?", "a ses_… id (default: KABU_SESSION)")
 TEXT_ARG = ("text", "*", "MESSAGE, or TITLE MESSAGE; - reads the message from stdin")
 SAMPLES = {"send": 'send "Build passed"', "ask": 'ask "Deploy to prod?"'}
 SUBCOMMAND_SAMPLES = {"session": 'start --title "Fix auth"', "presence": "status"}
-NAMES = ("send", "ask", "status", "whoami", "session", "login", "mcp", "presence", "guide", "help")
-LEGACY = ("daemon", "listen", "service", "steer", "identity", "project")  # kabu.py's commands that kabu does not have
+NAMES = ("send", "ask", "status", "whoami", "project", "session", "login", "mcp", "presence", "guide", "help")
+LEGACY = ("daemon", "listen", "service", "steer", "identity")  # kabu.py's commands that kabu does not have
 YES_NO = {("yes", "no"), ("y", "n"), ("approve", "reject")}  # the -c pairs that make a bare --ask kabu.py's yes or no
 RENAMED = {"--check-status": "Use: kabu status MSG_ID", "--progress": "Use: kabu session update --progress 3/8",
            "--quiet": "Drop the JSON: kabu send … > /dev/null", "-q": "Drop the JSON: kabu send … > /dev/null",
@@ -704,8 +909,12 @@ GUIDE = """\nFor coding agents:
   kabu status exits 0 whatever the answer: read .status and .resolution.decision.
 - Exit 3 with an error that names an ask's id: the ask is still open, so wait with kabu status ID --wait 50, never ask
   again. Exit 21 with ask_gone: it was deleted with its project and will never be answered; ask again if still needed.
-- The project is your agent session's (the repo it started in) whatever folder kabu runs in, never a temp folder's;
-  .project_source says why. KABU_PROJECT and KABU_AGENT override; KABU_SESSION puts messages in a session.
+- Never pass --project unless the user named one: kabu names it, the same for every agent, subagent, subfolder and
+  worktree of one piece of work, from your agent session's folder (a .kabu or .env KABU_PROJECT there or above, up to
+  the home folder; else a name kabu project set gave it or a folder above; else its git repository), never a temp
+  folder's. kabu project shows it and .project_source says why. When .project_source.rule is folder (<folder>@<host>),
+  tell the user its hint, kabu project set NAME --dir DIR, names that workspace once for every agent.
+  KABU_PROJECT and KABU_AGENT override; KABU_SESSION puts messages in a session.
 - kabu.py's calls work too: kabu --title T "message" --file-path X; kabu --ask Q -c Yes -c No is yes or no (No exits 10)."""
 
 
@@ -1064,6 +1273,82 @@ def cmd_whoami(cmd: str, a: JSON) -> int:
                  "config_path": str(default_config_path())})
 
 
+def cmd_project(cmd: str, a: JSON) -> int:
+    """kabu project: what a send here names and why; set, unset and list: the project map, folder to name (CONTRACT.md,
+    The project map). No API call."""
+    check(cmd, COMMANDS[cmd].opts, a)
+    action = cmd.partition(" ")[2]
+    if action == "list":
+        return emit({"ok": True, "map": str(map_path()), "projects": [{"dir": d, "project": n, "exists": os.path.isdir(d)}
+                                                                      for d, n in sorted(project_map(strict=True).items())]})
+    folder = on_disk(Path(os.path.expanduser(a["dir"]))) if a["dir"] else None  # as an agent there has it; never raises
+    if not action:
+        project, source = resolve_project(folder, alone=True) if folder else resolve_project()
+        return emit({"ok": True, "project": project, "project_source": source})
+    entries = project_map(strict=True)
+    if action == "set":
+        words: List[str] = a["name"]
+        name = words[0].strip() if len(words) == 1 else ""
+        if len(words) > 1:
+            raise CliError("unexpected_argument", f"kabu project set takes one NAME, not {len(words)} words.",
+                           f"Quote a name with spaces: kabu project set {shlex.quote(' '.join(words))}")
+        if not name:
+            raise CliError("missing_argument", "kabu project set needs a NAME.", 'Example: kabu project set "CTF Nov 2026"')
+        if len(name) > PROJECT.limit:
+            raise CliError("too_long", f"The name is {len(name)} characters; the limit is {PROJECT.limit}.",
+                           f"Example: kabu project set {PROJECT.example}")
+        folder = folder or default_dir()
+        why = unnameable(folder)
+        if why:
+            raise CliError("invalid_value", f"--dir {folder} {why}, so it never takes a name.",
+                           f"Name the workspace folder itself: kabu project set {shlex.quote(name)} --dir ~/work/my-workspace")
+        named = map_entries(entries, folder)  # its own entry, and any that names it another way: one entry a folder
+        previous = entries[named[0]] if named else None
+        for key in named:
+            del entries[key]
+        entries[str(folder)] = name
+        save_config(entries, map_path())
+        done: JSON = {"name": name, "previous": previous}
+    else:
+        folder = folder or default_dir()
+        named = map_entries(entries, folder)
+        done = {"removed": entries[named[0]] if named else None}
+        for key in named:
+            del entries[key]
+        if named:
+            save_config(entries, map_path())
+    project, source = resolve_project(folder, alone=True)
+    return emit({"ok": True, "dir": str(folder), **done, "map": str(map_path()), "project": project, "project_source": source})
+
+
+def unnameable(folder: Path) -> str:
+    """Why kabu project set never names a folder, "" when it may: one that is not a folder, /, the home folder, or a temp
+    folder, but for a worktree of a repository whose main worktree is outside them, as a folder names a project."""
+    if not folder.is_dir():
+        return "is not a folder"
+    if folder.parent == folder or folder == Path(os.path.expanduser("~")).resolve():
+        return "is /, which holds every workspace" if folder.parent == folder else "is your home folder, which holds every workspace"
+    main = _repo(folder, {})[1] if is_temp(folder) else None
+    return "is a temp folder" if is_temp(folder) and (main is None or is_temp(main)) else ""
+
+
+def default_dir() -> Path:
+    """kabu project set's and unset's folder: the first of the main worktree's top of this folder's repository, the agent
+    session's root and this folder that may take a name."""
+    try:
+        here: Optional[Path] = Path.cwd().resolve()
+    except OSError:
+        here = None  # removed
+    agent = harness()
+    root = Path(os.environ["CLAUDE_PROJECT_DIR"]) if os.environ.get("CLAUDE_PROJECT_DIR") else process_cwd(agent[0]) if agent else None
+    found = [_repo(here, {})[1] if here else None, root, here]
+    for folder in (on_disk(f) for f in found if f is not None):  # as an agent there has it
+        if not unnameable(folder):
+            return folder
+    raise CliError("invalid_value", "Neither this folder, its repository nor your agent session's root may take a name: each is "
+                   "a temp folder, / or your home folder.", "Name the workspace: kabu project set NAME --dir ~/work/my-workspace")
+
+
 def device_login(api: Api, name: str) -> JSON:
     """RFC 8628: print a code for a person to approve in Kabu, then poll for this computer's own key."""
     auth = api.call("POST", "/v2/device_authorizations", {"name": name})
@@ -1112,10 +1397,9 @@ def cmd_login(cmd: str, a: JSON) -> int:
 
 
 def tool_project() -> Optional[str]:
-    """The project kabu mcp adds to a tool call, resolved for that call as kabu send would: one rules 1 to 5 name (the
-    environment, the session, the folder, the login), never a <folder>@<host> name, nor none."""
-    project, source = resolve_project()
-    return project if source["rule"] not in ("folder", "default") else None
+    """The project kabu mcp adds to a tool call, resolved for that call as kabu send would, <folder>@<host> included, so
+    the call, the session's other messages and its presence share one; None when no rule names one."""
+    return resolve_project()[0]
 
 
 def cmd_mcp(cmd: str, a: JSON) -> int:
@@ -1792,9 +2076,16 @@ def unlink(path: Path) -> None:
         pass
 
 
-def harness_slug(name: str) -> str:
-    """The agent a harness's process name stands for: claude is claude-code; one kabu does not know, as a slug."""
-    return AGENT_PROCESSES.get(name) or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:64] or "agent"
+def lane_agent(rec: JSON, name: str) -> str:
+    """The agent a lane stands for (CONTRACT.md, Presence): the harness its records name (the hook command's, pi's
+    extension's), else the one its process is named as (AGENT_PROCESSES); "" when its process is no harness, whose own
+    name kabu never sends. A process not named as a harness is one only when its records name one (Gemini CLI and pi
+    run as node or bun), and process 1 never then: init (launchd on macOS) is the parent of a hook whose harness exited
+    before it ran, as a harness killed while it starts a hook leaves one, so that hook's records name init."""
+    named = str(rec.get("harness") or "")
+    if name in AGENT_PROCESSES:
+        return named or AGENT_PROCESSES[name]
+    return named if int(rec["pid"]) > 1 else ""
 
 
 def api_tag(api: Api) -> str:
@@ -1807,13 +2098,10 @@ def ref_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-def lane_project(rec: JSON) -> str:
-    """The project the harness's folder names, as kabu send's; never a temp folder's, nor <folder>@<host>."""
-    try:
-        root = process_cwd(int(rec["pid"]))
-        return named_project(root.resolve())[0] if root else ""
-    except OSError:
-        return ""
+def lane_project(rec: JSON, start: str, name: str) -> str:
+    """An agent session's project, as a kabu send in it resolves it (Project resolution, for its harness: the harness's
+    own environment, its root, what the session kept, the login, the root's folder); "" for none."""
+    return resolve_project(lane=(int(rec["pid"]), start, name))[0] or ""
 
 
 def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start: str, name: str,
@@ -1821,24 +2109,21 @@ def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start
     """The Kabu session of an agent session: the one kept beside its records for this API, else get or create the
     session whose external_id is HMAC(installation secret, harness ‖ native session id), automatic (ADR 022: it
     claims no run, so it stays idle with no Live Activity of its own). Its
-    title is constant ('<harness> session'), and its project the one the harness's folder names, as kabu send's. The
-    reporter and a kabu send in that agent session so find the same one. None when the API cannot say. A Copilot CLI
-    agent session follows the agent and project its messages name (copilot_session); `bind` is for it alone."""
+    title is constant ('<harness> session'), and its project the one a kabu send in that agent session sends (lane_project),
+    kept with it: when that changes, the session of the new project is got or created (the API keeps one per project for
+    the same external_id), and the reporter follows the kept file (Reporter.rebound). The reporter and a kabu send in that
+    agent session so find the same one. None when the API cannot say. A Copilot CLI agent session follows the agent and
+    project its messages name (copilot_session); `bind` is for it alone."""
     native = str(rec.get("sid") or "") or f"pid:{rec['pid']}:{start}"
-    slug, path = str(rec.get("harness") or "") or harness_slug(name), folder / f"{lane}.session.json"
+    slug, path = lane_agent(rec, name), folder / f"{lane}.session.json"
     if slug == COPILOT_SLUG:
-        return copilot_session(api, inst, path, rec, slug, native, timeout, bind)
-    base = keyed(inst, "session", slug, native)[:40]
+        return copilot_session(api, inst, path, rec, slug, native, timeout, bind, start, name)
+    base, project = keyed(inst, "session", slug, native)[:40], lane_project(rec, start, name)
     kept = read_json(path)
     turn = int(kept.get("round") or 0) if kept.get("id") == base else 0  # a session that ended: the next one
-    if kept.get("api") == api_tag(api) and kept.get("id") == base and str(kept.get("session", "")).startswith("ses_") \
-            and kept["session"] not in gone_sessions(api.base)[1]:
+    if kept.get("api") == api_tag(api) and kept.get("id") == base and kept.get("project") == project \
+            and str(kept.get("session", "")).startswith("ses_") and kept["session"] not in gone_sessions(api.base)[1]:
         return str(kept["session"])
-    try:
-        root = process_cwd(int(rec["pid"]))
-        project = named_project(root.resolve())[0] if root else ""  # never a temp folder's, nor <folder>@<host>
-    except OSError:
-        project = ""
     body: JSON = {"title": f"{slug} session", "agent": slug, "automatic": True, **({"project": project} if project else {})}
     for n in range(turn, turn + 3):
         try:
@@ -1847,7 +2132,7 @@ def lane_session(api: Api, inst: JSON, folder: Path, lane: str, rec: JSON, start
         except CliError:
             return None
         if isinstance(got.get("id"), str) and got.get("status") not in ("ended", "expired") and not got.get("ended_at"):
-            write_private(path, {"api": api_tag(api), "id": base, "round": n, "session": got["id"]})
+            write_private(path, {"api": api_tag(api), "id": base, "round": n, "session": got["id"], "project": project})
             return str(got["id"])
     return None
 
@@ -1857,35 +2142,34 @@ COPILOT_SLUG = AGENT_PROCESSES["copilot"]
 
 
 def copilot_session(api: Api, inst: JSON, path: Path, rec: JSON, slug: str, native: str, timeout: float,
-                    bind: Optional[Tuple[str, str]]) -> Optional[str]:
+                    bind: Optional[Tuple[str, str]], start: str, name: str) -> Optional[str]:
     """A Copilot CLI agent session's Kabu session (B33). Copilot sessions name their own agent and project in what they
     send (`kabu send --agent "Kabu manager" --project …`), and the API rolls presence up by a session's agent, so a
-    send that names an agent or project other than the agent session's own (Copilot CLI, its folder's project; compared
-    as the API does) binds the agent session to them: its session is got or created as that agent in that project
+    send that names an agent or project other than the agent session's own (Copilot CLI, the project a send in it
+    resolves, lane_project; compared as the API does) binds the agent session to them: its session is got or created as
+    that agent in that project
     (external_id HMAC(… ‖ agent ‖ project), automatic, the same title), kept with the binding, and the
     reporter and kabu mcp (no `bind`) follow it. A send that names its own agent and project unbinds it. The target is
     kept before the API is asked, with no session: if the API cannot make it, the reporter takes the old session offline
     and reports nothing for the agent session (never the agent it was bound to before) until it can (B33 review)."""
-    base = keyed(inst, "session", slug, native)[:40]
+    base, own = keyed(inst, "session", slug, native)[:40], lane_project(rec, start, name)  # its own project, as of now
     kept = read_json(path)
     mine = kept.get("base", kept.get("id")) == base  # kept for this agent session (an older file names only its id)
-    own = str(kept["own"]) if mine and isinstance(kept.get("own"), str) else None
     if bind is None:
         held = kept.get("bind") if mine else None
         target = (str(held[0]), str(held[1])) if isinstance(held, list) and len(held) == 2 else None
     else:
-        own = lane_project(rec) if own is None else own
         target = None if (ref_key(bind[0]), ref_key(bind[1])) == (ref_key(slug), ref_key(own)) else bind
     want = base if target is None else keyed(inst, "session", slug, native, ref_key(target[0]), ref_key(target[1]))[:40]
+    agent, project = target if target else (slug, own)
     turn = int(kept.get("round") or 0) if kept.get("id") == want else 0  # a session that ended: the next one
-    if kept.get("api") == api_tag(api) and kept.get("id") == want and str(kept.get("session", "")).startswith("ses_") \
-            and kept["session"] not in gone_sessions(api.base)[1]:
+    if kept.get("api") == api_tag(api) and kept.get("id") == want and kept.get("project") == project \
+            and str(kept.get("session", "")).startswith("ses_") and kept["session"] not in gone_sessions(api.base)[1]:
         return str(kept["session"])
-    own = lane_project(rec) if own is None else own
-    entry: JSON = {"api": api_tag(api), "base": base, "id": want, "round": turn, "own": own, **({"bind": list(target)} if target else {})}
+    entry: JSON = {"api": api_tag(api), "base": base, "id": want, "round": turn, "own": own, "project": project,
+                   **({"bind": list(target)} if target else {})}
     if kept != entry:
         write_private(path, entry)  # the target, and no session, before the API is asked: a failure reports nothing
-    agent, project = target if target else (slug, own)
     body: JSON = {"title": f"{slug} session", "agent": agent, "automatic": True, **({"project": project} if project else {})}
     for n in range(turn, turn + 3):
         try:
@@ -1905,7 +2189,7 @@ def lane_ended(folder: Path, lane: str) -> None:
     kept = read_json(path)
     if kept:
         write_private(path, {"api": kept.get("api"), "id": kept.get("id"), "round": int(kept.get("round") or 0) + 1,
-                             **{k: kept[k] for k in ("base", "own", "bind") if k in kept}})
+                             **{k: kept[k] for k in ("base", "own", "bind", "project") if k in kept}})
 
 
 def presence_join(api: Api, agent: Optional[str] = None, project: Optional[str] = None) -> Tuple[Optional[str], Optional[Path], str]:
@@ -2047,16 +2331,17 @@ class Reporter:
 
     def scan(self, now: float) -> None:
         """Fold every lane's records and keep only its latest. A new lane is adopted only while its harness runs, is no
-        zombie, and started before its latest record was written: a record older than the process with its id is
-        another process's, left behind."""
+        zombie, is a harness (lane_agent), and started before its latest record was written: a record older than the
+        process with its id is another process's, left behind."""
         seen = fold(self.folder, now=now)
         new = [key for key in seen if key not in self.lanes]
         info = processes([int(seen[key].rec["pid"]) for key in new]) if new else {}
         for key in new:
             first, proc = seen[key], info.get(int(seen[key].rec["pid"]))
             started = proc_start(proc.start) if proc else None
-            if proc is None or proc.zombie or first.rec["runtime"] == "offline" or started is None or first.mtime < started - 1:
-                self.forget(key, first.files)  # exited, ended or stale before anyone reported it: nothing to say
+            if proc is None or proc.zombie or first.rec["runtime"] == "offline" or started is None or first.mtime < started - 1 \
+                    or not lane_agent(first.rec, proc.name):
+                self.forget(key, first.files)  # exited, ended, stale or no harness before anyone reported it: nothing to say
                 continue
             self.lanes[key] = Lane(first.rec, first.mtime, proc.start, proc.name, checked=now)
         retired: Dict[str, Lane] = {}
@@ -2083,12 +2368,12 @@ class Reporter:
             self.rebound(key, lane, now)
 
     def rebound(self, key: str, lane: Lane, now: float) -> None:
-        """A Copilot CLI lane whose kept file names another session than the one reported (a send bound it to the agent and
-        project it names, copilot_session), or none (the API could not make that one yet): the old session goes offline
-        once, at the next batch, and the lane reports the kept one, or nothing until the API makes it. Never the old one:
-        a failed switch reports nothing rather than the wrong agent. One stat a look; the file is read only when it
-        changed."""
-        if lane.gone or lane.session is None or (str(lane.rec.get("harness") or "") or harness_slug(lane.name)) != COPILOT_SLUG:
+        """A lane whose kept file names another session than the one reported: a send moved it to the project its agent
+        session now resolves to (lane_session), or bound a Copilot CLI lane to the agent and project it names
+        (copilot_session), or none (the API could not make that one yet): the old session goes offline once, at the
+        next batch, and the lane reports the kept one, or nothing until the API makes it. Never the old one: a failed
+        switch reports nothing rather than the wrong agent. One stat a look; the file is read only when it changed."""
+        if lane.gone or lane.session is None:
             return
         path = self.folder / f"{key}.session.json"
         try:
@@ -2204,7 +2489,7 @@ class Reporter:
             value = values.get(key)
             if value is None:
                 continue
-            copilot = (str(lane.rec.get("harness") or "") or harness_slug(lane.name)) == COPILOT_SLUG
+            copilot = lane_agent(lane.rec, lane.name) == COPILOT_SLUG
             if lane.session is None and not lane.gone and (not copilot or now >= lane.make_at):
                 lane.session = lane_session(api, self.inst, self.folder, key, lane.rec, lane.start, lane.name)
                 lane.make_at = now + PRESENCE_MAKE_RETRY if copilot and lane.session is None else 0.0
@@ -2336,7 +2621,68 @@ def presence_status() -> JSON:
             "opted_out": os.environ.get("KABU_PRESENCE") == "0", "running": pid > 1 and alive(pid), "pid": pid if pid > 1 and alive(pid) else None,
             "instance": inst.get("instance"), "generation": inst.get("generation"), "dir": str(folder), "lanes": lanes,
             "last_beat": run.get("last_beat"), "ack": run.get("ack"),
-            "herdr": {"on": herdr_on(), "found": shutil.which("herdr") is not None, "last": run.get("herdr")}}
+            "herdr": {"on": herdr_on(), "found": shutil.which("herdr") is not None, "last": run.get("herdr")},
+            "copilot": copilot_restarts()}
+
+
+def copilot_restarts() -> List[JSON]:
+    """The running Copilot CLI sessions (copilot, or the Copilot app's copilot-runtime; not one another of them started)
+    that report no presence until restarted: Copilot reads its hooks when a session starts, so one whose home (its
+    COPILOT_HOME, read from its environment, else ~/.copilot) has no Kabu hook, or got it after the session started, has
+    none. A session whose environment or start time kabu cannot read is left out, and so is one whose hooks already
+    write its lane's records: a plugin updated since it started dates its hooks file after it, yet it runs the hooks it
+    loaded."""
+    names = {name for name, slug in AGENT_PROCESSES.items() if slug == COPILOT_SLUG}
+    procs = processes([int(n) for n in os.listdir(PROC) if n.isdigit()]) if (PROC / "self" / "stat").exists() else processes()
+    folder = runtime_dir()
+    lanes = fold(folder) if own_dir(folder) else {}
+    found: List[JSON] = []
+    for pid, proc in sorted(procs.items()):
+        parent = procs.get(proc.ppid)
+        if proc.name not in names or proc.zombie or parent is not None and parent.name in names:
+            continue
+        env, started = process_env(pid), proc_start(proc.start)
+        if env is None or started is None:
+            continue
+        lane = lanes.get(f"l{pid}")
+        if lane is not None and lane.rec.get("source", "hook") == "hook" and lane.mtime >= started - 1:
+            continue  # its hooks write its records: it reports already
+        home = Path(env.get("COPILOT_HOME") or Path.home() / ".copilot")
+        at = hooked_at(home)
+        if at is None or started < at - 1:  # ps gives whole seconds
+            found.append({"pid": pid, "home": str(home), "started_at": iso(started), "reason": "no_hook" if at is None else "started_before_hook",
+                          "hint": ("Run kabu presence install --harness copilot, then restart this session: Copilot reads its hooks "
+                                   "when a session starts" if at is None else "Restart this session: it started before its home "
+                                   "got the Kabu hook, and Copilot reads its hooks when a session starts")})
+    return found
+
+
+def hooked_at(home: Path) -> Optional[float]:
+    """When a Copilot home got Kabu's presence hook, None when it has none: in its settings.json (when installs.json says
+    kabu first added it there, else the time of the backup made then, else the file's), or through an enabled Kabu
+    plugin (its hooks file's time); the earliest."""
+    path, times = home / "settings.json", []
+    try:
+        settings = json.loads(read_private(path, 1 << 20) or b"{}")
+    except ValueError:
+        settings = {}
+    settings = settings if isinstance(settings, dict) else {}
+    hooks, plugins = settings.get("hooks"), settings.get("enabledPlugins")
+    if isinstance(hooks, dict) and any(ours(e) for v in hooks.values() if isinstance(v, list) for e in v):
+        entry = read_json(presence_dir() / "installs.json").get(str(path.resolve())) or {}
+        for at in (entry.get("at"), entry.get("backup"), str(path)):
+            try:
+                times.append(float(at) if isinstance(at, (int, float)) else os.stat(str(at)).st_mtime)
+                break
+            except (OSError, ValueError, TypeError):
+                continue
+    for key, on in plugins.items() if isinstance(plugins, dict) else ():
+        name, _, market = str(key).partition("@")
+        try:
+            times += [os.stat(home / "installed-plugins" / market / name / "hooks" / "hooks.json").st_mtime] if name == "kabu" and on is True else []
+        except OSError:
+            pass
+    return min(times) if times else None
 
 
 def settings_file(harness_name: str, given_path: Optional[str]) -> Path:
@@ -2525,19 +2871,62 @@ class SettingsFile:
 def presence_install(a: JSON, install: bool) -> JSON:
     """Add the presence hook to a harness's settings, or take it out, after a backup. Install is idempotent; uninstall
     puts back the exact bytes from before the install when the file is as kabu left it, else takes out only kabu's
-    entries. The hook file goes once no settings use it (presence/installs.json keeps what was installed where)."""
+    entries. The hook file goes once no settings use it (presence/installs.json keeps what was installed where, and
+    when). Copilot CLI without --settings: every Copilot home (copilot_homes), each read and checked before any changes."""
     if a["harness"] == "pi":
         return pi_install(a, install)
-    path, hook, manifest_path = settings_file(a["harness"], a["settings"]), kabu_home() / HOOK_FILE, presence_dir() / "installs.json"
+    hook, manifest_path = kabu_home() / HOOK_FILE, presence_dir() / "installs.json"
     if not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)) or not own_dir(presence_dir(), create=True):
         raise CliError("unsafe_folder", f"{presence_dir()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
     if re.search(r"[\x00-\x1f'\"$`\\]", os.path.abspath(hook)):  # it goes inside the quotes of hook_command
         raise CliError("unsafe_folder", f"{hook} has a quote, $, ` or \\ in its path, which a hook command cannot hold.",
                        "Set KABU_HOME to a folder without them, then run this again.")
+    if a["harness"] != "copilot" or a["settings"]:
+        return install_into(a, install, settings_file(a["harness"], a["settings"]), hook, manifest_path)
+    paths = [home / "settings.json" for home in copilot_homes()]
+    for path in paths:  # every home is read before any is changed: one kabu cannot use changes none
+        target: Optional[SettingsFile] = None
+        try:
+            target = SettingsFile.open(path)  # a link on the way, or a folder not this user's: unsafe_settings, as any other
+            if target is None and install:
+                raise missing_settings(path)
+            if target is not None:
+                parse_settings(path, target.read()[0])
+        except CliError as e:
+            raise CliError(e.code, e.message, e.hint + (" To install into the other Copilot homes, name each: --settings PATH"
+                                                        if len(paths) > 1 else ""), e.exit) from None
+        finally:
+            if target is not None:
+                target.close()
+    done = [install_into(a, install, path, hook, manifest_path) for path in paths]
+    return {**done[0], "changed": any(d["changed"] for d in done), "homes": [{k: d[k] for k in ("settings", "changed", "backup")} for d in done]}
+
+
+def copilot_homes() -> List[Path]:
+    """Every Copilot CLI home kabu finds (CONTRACT.md, Presence), the default first: COPILOT_HOME (even missing: its install
+    says so), ~/.copilot, and each ~/.copilot-* folder that holds a settings.json or config.json, as the Copilot app's
+    runtime and each profile read their own; ~/.copilot alone when there is none."""
+    home = Path.home()
+    found = [Path(os.environ["COPILOT_HOME"])] if os.environ.get("COPILOT_HOME") else []
+    found += [home / ".copilot"] if (home / ".copilot").is_dir() else []
+    found += [d for d in sorted(home.glob(".copilot-*")) if (d / "settings.json").is_file() or (d / "config.json").is_file()]
+    unique: List[Path] = []
+    for d in found or [home / ".copilot"]:
+        if os.path.abspath(d) not in map(os.path.abspath, unique):
+            unique.append(d)
+    return unique
+
+
+def missing_settings(path: Path) -> CliError:
+    return CliError("missing_folder", f"{path.parent} does not exist, so kabu has no settings to add to.",
+                    "Start the harness once, or name the settings file with --settings, then run this again.")
+
+
+def install_into(a: JSON, install: bool, path: Path, hook: Path, manifest_path: Path) -> JSON:
+    """presence_install for one settings file."""
     target = SettingsFile.open(path)
     if target is None and install:
-        raise CliError("missing_folder", f"{path.parent} does not exist, so kabu has no settings to add to.",
-                       "Start the harness once, or name the settings file with --settings, then run this again.")
+        raise missing_settings(path)
     if target is None:  # nothing to take out: only what kabu kept of it goes
         manifest = read_json(manifest_path)
         manifest.pop(str(path.resolve()), None)
@@ -2552,15 +2941,21 @@ def presence_install(a: JSON, install: bool) -> JSON:
         target.close()
 
 
-def settings_install(a: JSON, install: bool, path: Path, hook: Path, manifest_path: Path, target: SettingsFile) -> JSON:
-    """presence_install's work on a settings file reached through its verified folder (SettingsFile)."""
-    raw, mode = target.read()
+def parse_settings(path: Path, raw: Optional[bytes]) -> JSON:
+    """A settings file's JSON object, with a hooks object kabu can add to; else invalid_settings, and the file is left as it is."""
     try:
         settings = json.loads(raw) if raw and raw.strip() else {}
     except ValueError as exc:
         raise CliError("invalid_settings", f"{path} is not JSON ({exc}), so kabu left it as it is.", "Fix the file, then run this again.") from None
     if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
         raise CliError("invalid_settings", f"{path} has no hooks object kabu can add to.", "Fix the file, then run this again.")
+    return settings
+
+
+def settings_install(a: JSON, install: bool, path: Path, hook: Path, manifest_path: Path, target: SettingsFile) -> JSON:
+    """presence_install's work on a settings file reached through its verified folder (SettingsFile)."""
+    raw, mode = target.read()
+    settings = parse_settings(path, raw)
     manifest = read_json(manifest_path)
     key, entry = str(path.resolve()), manifest.get(str(path.resolve())) or {}
     hooks: JSON = {}
@@ -2580,7 +2975,8 @@ def settings_install(a: JSON, install: bool, path: Path, hook: Path, manifest_pa
             saved += [target.backup(raw)] if raw is not None else []
             target.replace(new, mode)
             manifest[key] = {"harness": a["harness"], "before": entry.get("before", digest(raw) if raw is not None else None),
-                             "backup": entry.get("backup", saved[0] if saved else None), "after": digest(new)}
+                             "backup": entry.get("backup", saved[0] if saved else None), "after": digest(new),
+                             "at": entry.get("at", time.time())}  # when it first got the hook: sessions started before lack it
     else:
         changed = raw is not None and (key in manifest or any(ours(e) for v in settings.get("hooks", {}).values() for e in (v if isinstance(v, list) else [])))
         if changed and raw is not None:
@@ -2660,6 +3056,22 @@ COMMANDS = {
   kabu status msg_01J9Z --wait 50     hold up to 50 s while an ask is pending""", STATUS, ("id", "?", "a msg_… id")),
     "whoami": Command(cmd_whoami, "Print what the key can do, its org, and the project (and why) and agent kabu would send.", """\
   kabu whoami""", CONNECTION),
+    "project": Command(cmd_project, "Print the project a send here would name and why (project_source), with no API call. "
+                       "kabu project set NAME names a folder for every agent, subfolder and worktree in it; unset and list.", """\
+  kabu project                              the project here, and the rule, file or folder that named it
+  kabu project --dir ~/work/ctf             what a folder names
+  kabu project set "CTF Nov 2026"           name this repository, or your agent session's folder
+  kabu project list""", PROJECT_SHOW),
+    "project set": Command(cmd_project, "Name a folder's project in your project map (projects.json beside the config), so "
+                           "everything in it sends NAME: subfolders, repositories in it and their worktrees, every agent and "
+                           "subagent. No file in the folder, no API call. Prints what the folder resolves to now.", """\
+  kabu project set "CTF Nov 2026" --dir ~/workspace/ctf-nov-2026
+  kabu project set Hackweek                 here: this repository's main worktree, else your agent session's folder""",
+                           PROJECT_SET, ("name", "*", "the project's name, max 64; quote one with spaces")),
+    "project unset": Command(cmd_project, "Take a folder's name out of your project map. Prints what it resolves to now.", """\
+  kabu project unset --dir ~/workspace/ctf-nov-2026""", PROJECT_SET),
+    "project list": Command(cmd_project, "List your project map: each folder, its name, and whether the folder still exists.", """\
+  kabu project list | jq -r '.projects[] | "\\(.project)  \\(.dir)"'""", (CONNECTION[3],)),
     "session start": Command(cmd_session, "Get or create a running session with a Live Activity. Prints the session.", """\
   export KABU_SESSION=$(kabu session start --title "Fix flaky auth test" | jq -r .id)
   kabu session start --title "Nightly build" --external-id run-77 --headline "Compiling" --progress 1/4""",
@@ -2697,6 +3109,7 @@ COMMANDS = {
     "presence install": Command(cmd_presence, "Add the presence hook to a harness's settings, after a backup; running it again "
                                 "changes nothing. Not needed with the Kabu plugin, which has the hook.", """\
   kabu presence install --harness claude
+  kabu presence install --harness copilot     every Copilot home; restart the sessions kabu presence status lists
   kabu presence install --harness copilot --settings ~/.copilot-work/settings.json
   kabu presence install --harness codex       Codex then asks you to trust its hooks once, in /hooks
   kabu presence install --harness pi          an extension pi loads at its next start""", PRESENCE_SETTINGS),
@@ -2723,7 +3136,11 @@ def run(args: List[str]) -> int:
         if args[1:] and args[1] not in NAMES:
             raise CliError("unknown_command", f"kabu has no {args[1]!r} command.", "Run: kabu --help")
         return run(args[1:] + ["--help"])
-    name = " ".join(args[:2]) if head in ("session", "presence") else head
+    if head == "project" and args[1:2] and not args[1].startswith("-") and f"project {args[1]}" not in COMMANDS:
+        close = difflib.get_close_matches(args[1], ("set", "unset", "list"), n=1)
+        raise CliError("unknown_command", f"kabu project takes set, unset or list, not {args[1]!r}." + (f" Did you mean {close[0]!r}?" if close
+                       else " kabu.py's project settings are not in kabu."), 'Example: kabu project set "CTF Nov 2026"')
+    name = " ".join(args[:2]) if head in ("session", "presence") or head == "project" and " ".join(args[:2]) in COMMANDS else head
     if name in COMMANDS:
         return COMMANDS[name].handler(name, parse(name, args[len(name.split()):]))
     if head in ("session", "presence"):
@@ -2732,8 +3149,8 @@ def run(args: List[str]) -> int:
         raise CliError("unknown_command", f"kabu {head} takes {', '.join(subs[:-1])} or {subs[-1]}, not {' '.join(args[1:2])!r}."
                        + (f" Did you mean {close[0]!r}?" if close else ""), f"Example: kabu {head} {SUBCOMMAND_SAMPLES[head]}")
     if head in LEGACY:  # never a message: a steering LaunchAgent may still run `kabu.py daemon`
-        raise CliError("unknown_command", f"kabu has no {head!r} command: kabu.py's steering ({', '.join(LEGACY[:5])}) and project "
-                       "settings are not in kabu.", f"Use the legacy kabu.py 0.2.0 for it. To send the word itself: kabu send {head}")
+        raise CliError("unknown_command", f"kabu has no {head!r} command: kabu.py's steering ({', '.join(LEGACY)}) is not in kabu.",
+                       f"Use the legacy kabu.py 0.2.0 for it. To send the word itself: kabu send {head}")
     close = difflib.get_close_matches(head, NAMES, n=1, cutoff=0.75) if head.isalpha() else []
     if close:
         raise CliError("unknown_command", f"kabu has no {head!r} command. Did you mean {close[0]!r}?",
