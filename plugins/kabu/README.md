@@ -67,13 +67,28 @@ kabu session start --title "Migrate billing" --headline "Copying tables" --progr
 
 Every command prints JSON; `kabu --help` and `kabu COMMAND --help` list the options, limits and exit codes.
 
+## Projects
+
+Every message names a project, and the app groups threads by it. `kabu` names it for you, the same for every agent,
+subagent, subfolder and worktree of one piece of work: from the folder the agent session started in, the nearest
+`.kabu` file (`project = NAME`) or `KABU_PROJECT` in `.env`, up to your home folder; else the name you gave that folder
+or one above it with `kabu project set`; else its git repository. So the agent never needs `--project`. When nothing
+names one, it sends the folder's name and your computer's, such as `notes@my-mac`, and the output's
+`project_source.hint` says how to name it once:
+
+```bash
+kabu project                                              # the project here, and why
+kabu project set "CTF Nov 2026" --dir ~/work/ctf-nov-2026 # every folder, repository and agent in it, no file needed
+kabu project list
+```
+
 ## MCP
 
 The plugin starts an MCP server named `kabu` as `python3 bin/kabu mcp`. It relays MCP over stdio to
 `https://usekabu.com/mcp` (or `KABU_BASE_URL`) with your saved key, so the agent also gets the tools `notify_human`,
 `ask_human`, `wait_for_human_answer` and `upload_file_for_human`. For the tools that take a project it fills in the
-one your session's folders name, at each call, unless your key is bound to a project. Check it with `/mcp` in Claude
-Code or Copilot CLI.
+project `kabu send` would name (Projects, above), at each call, unless your key is bound to a project. Check it with
+`/mcp` in Claude Code or Copilot CLI.
 It reads the login saved by `kabu login --device`, which works in both clients. Settings such as `KABU_API_KEY` and
 `KABU_BASE_URL` reach it only if the client passes your shell's environment on to its MCP servers, so prefer the
 saved login.
@@ -104,8 +119,9 @@ changes.
 
 What leaves your computer: the state (working, idle, waiting at the computer, gone), ids made from a hash (never the
 client's own session id), the client's name (such as `claude-code`) and the project the session runs in, as `kabu send` already
-sends with every message. Never a prompt, a file path, a tool name, a title or your computer's name. `kabu send` and
-`kabu ask` in the same session go in that session.
+sends with every message (when nothing names one, its folder's name and your computer's, until `kabu project set` names
+it). Never a prompt, a file path, a tool name or a title. `kabu send` and `kabu ask` in the same session go in that
+session, and when its project changes, its presence moves with its next message.
 
 | To | Run |
 |---|---|
@@ -114,7 +130,10 @@ sends with every message. Never a prompt, a file path, a tool name, a title or y
 | Turn it off for one agent | Set `KABU_PRESENCE=0` in the environment the agent starts from |
 
 Without the plugin, `kabu presence install --harness claude` (or `--harness copilot`) adds the same hook to the
-client's settings, after a backup; `kabu presence uninstall` takes it out. Use one or the other.
+client's settings, after a backup; `kabu presence uninstall` takes it out. Use one or the other. `--harness copilot`
+adds it to every Copilot home it finds: `COPILOT_HOME`, `~/.copilot` and each `~/.copilot-*` profile with a
+`settings.json` or `config.json`, the Copilot app's included. Copilot reads its hooks when a session starts, so restart
+the sessions `kabu presence status` lists under `copilot`.
 
 Other agents get presence the same way, with `kabu presence install --harness NAME` and the `kabu` CLI on your PATH:
 
@@ -143,7 +162,8 @@ nothing else Herdr prints leaves your computer. It is off by default, and `kabu 
 | `kabu: command not found` | Use the plugin's copy, as in Log in, or `python3 <plugin>/bin/kabu` |
 | MCP server failed, or `HTTP 401` from a tool | Log in again: the key is missing or revoked (`kabu whoami` shows which is in use). Then reconnect `kabu` in `/mcp`, or restart |
 | No push arrives | `kabu send "Test" --dry-run` shows what would be sent; check the app is signed in to the same account |
-| Messages land in another project | The project is the one of the folder the agent session started in, whatever folder a command runs in; `kabu whoami` shows it and, in `project_source`, why. Set `KABU_PROJECT` to choose another |
+| Messages land in another project | The project is what the folder the agent session started in names, whatever folder a command runs in (Projects, above); `kabu project` shows it and, in `project_source`, why. Name a workspace once with `kabu project set NAME --dir DIR`; set `KABU_PROJECT` to choose another for one agent |
+| A Copilot session never reads working | `kabu presence status` lists it under `copilot`: run `kabu presence install --harness copilot` if it says `no_hook`, then restart that session |
 | An ask returns exit 20 | It expired unanswered; raise `--expires-in` (default 300 seconds) |
 | No hook pushes | Set `KABU_HOOKS=1` before starting the agent, then restart it |
 | The app shows no presence | `kabu presence status`: `enabled`, a `lanes` entry for the session and `last_beat` without an `error`; log in if it is `missing_api_key` |
