@@ -11,7 +11,8 @@ Commands:
   kabu session start|update|end a session and its Live Activity (--headline, --progress N/M when measured)
   kabu login                    save --api-key KEY, or connect this computer with --device
   kabu mcp                      Kabu's MCP tools on stdin and stdout, for an agent harness to start
-  kabu guide                    a copy-paste cheat sheet for coding agents (also: kabu help agents)
+  kabu guide                    Kabu's rules for coding agents, then every command (also: kabu help agents)
+  kabu agents install|status|uninstall  put those rules in every coding agent's global instructions, opt-in
   kabu help COMMAND             one command's options and examples (same as kabu COMMAND --help)
 
 Presence (on by default; KABU_PRESENCE=0 or kabu presence off turns it off): kabu presence status shows whether your
@@ -59,7 +60,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 EXIT_OK, EXIT_USAGE, EXIT_TRANSPORT = 0, 2, 3
 EXIT_REJECTED, EXIT_EXPIRED, EXIT_CANCELLED = 10, 20, 21  # an ask's outcomes; login --device: denied, expired
 DEFAULT_BASE_URL = "https://usekabu.com"
@@ -886,12 +887,34 @@ PROJECT_SET = (
     CONNECTION[3],
 )
 PROJECT_SHOW = (Opt(("--dir",), "what a command in DIR outside an agent session would name", "~/work/ctf", metavar="DIR"), CONNECTION[3])
+AGENT_NAMES = {"claude": "Claude Code", "copilot": "Copilot CLI", "codex": "Codex", "gemini": "Gemini CLI", "cursor": "Cursor",
+               "pi": "pi", "opencode": "OpenCode"}  # kabu agents' harnesses, in presence's names and order, then OpenCode
+
+
+def agent_harness(cmd: str, name: str) -> str:
+    if name not in AGENT_NAMES:
+        raise CliError("invalid_value", f"--harness takes {', '.join(AGENT_NAMES)}, not {name!r}.", f"Example: kabu {cmd} --harness claude")
+    return name
+
+
+AGENTS = (
+    Opt(("--harness",), "only this harness, repeatable: " + ", ".join(AGENT_NAMES) + " (default: every one whose folder exists)",
+        "claude", kind="list", metavar="NAME", convert=agent_harness),
+    CONNECTION[3],
+    Opt(("--dry-run",), "write nothing, not even a backup: each file's change as a unified diff (diff)", kind="flag"),
+)
+AGENTS_INSTALL = AGENTS + (
+    Opt(("--replace-legacy",), "also back up and remove a notify.py instructions file whose text kabu knows (legacy: replaceable)",
+        kind="flag"),
+    Opt(("--plugin",), "also install the Kabu plugin into each Copilot home without it: copilot plugin install kabu@ai-agentics",
+        kind="flag"),
+)
 ENV_HELP = "\n\nEnvironment: KABU_API_KEY, KABU_BASE_URL, KABU_PROJECT, KABU_AGENT, KABU_SESSION and more: kabu --help."
 SESSION_ID = ("id", "?", "a ses_… id (default: KABU_SESSION)")
 TEXT_ARG = ("text", "*", "MESSAGE, or TITLE MESSAGE; - reads the message from stdin")
 SAMPLES = {"send": 'send "Build passed"', "ask": 'ask "Deploy to prod?"'}
-SUBCOMMAND_SAMPLES = {"session": 'start --title "Fix auth"', "presence": "status"}
-NAMES = ("send", "ask", "status", "whoami", "project", "session", "login", "mcp", "presence", "guide", "help")
+SUBCOMMAND_SAMPLES = {"session": 'start --title "Fix auth"', "presence": "status", "agents": "status"}
+NAMES = ("send", "ask", "status", "whoami", "project", "session", "login", "mcp", "presence", "agents", "guide", "help")
 LEGACY = ("daemon", "listen", "service", "steer", "identity")  # kabu.py's commands that kabu does not have
 YES_NO = {("yes", "no"), ("y", "n"), ("approve", "reject")}  # the -c pairs that make a bare --ask kabu.py's yes or no
 RENAMED = {"--check-status": "Use: kabu status MSG_ID", "--progress": "Use: kabu session update --progress 3/8",
@@ -899,6 +922,35 @@ RENAMED = {"--check-status": "Use: kabu status MSG_ID", "--progress": "Use: kabu
            "--id-only": "Read the id: kabu send … | jq -r .id", "--fyi": "An FYI is a notify: kabu send TITLE MESSAGE",
            "--category": "Use --field category=VALUE.", "--metadata": "Use --field KEY=VALUE, a fact the human sees.",
            "--max-retries": "kabu retries 3 times by itself.", "--client-event-id": "kabu sends an Idempotency-Key by itself."}
+# Kabu's rules for coding agents: kabu guide prints them first, and kabu agents install writes them, between its markers,
+# into each harness's global instructions. Every flag and exit code here is CONTRACT.md's.
+AGENT_RULES = """\
+# Kabu: ask and update the user on their phone
+
+`kabu` pushes to the user's phone (the Kabu app) and waits for their answer. Each command prints one JSON object; an
+error is one JSON line on stderr whose `hint` is the next step.
+
+- **Ask with `kabu ask`, not your built-in ask tool**, whenever you need a decision, a confirmation or a value only
+  the user knows and they may be away from the terminal: a push reaches them, a terminal prompt just waits.
+  - Yes or no: `kabu ask "Deploy to prod?"` exits 0 approved, 10 rejected.
+  - A choice: `kabu ask "Which env?" -c staging -c prod` exits 0 whatever is picked: read `.option`.
+  - A typed answer: `kabu ask "Branch name?" --type text`: read `.text`.
+  - Only exit 0 is a yes: never act on any other exit code (10 rejected, 20 expired, 21 cancelled). If your tool call
+    may time out first, run `kabu ask … --no-wait`, then `kabu status ID --wait 50`.
+  - Ask before anything destructive or irreversible: a force-push, deleting data, a production deploy.
+- **Keep the user updated without being asked**: `kabu send "Title" "What happened"` when you start a non-trivial
+  task, at each milestone, at once when you are blocked (`--priority high`) and when you finish. Attach proof:
+  `--file PATH` for a screenshot or report (up to 10), `--link "PR=URL"` for a PR or dashboard (up to 4). A long
+  silent task is a bug.
+- **One project name per piece of work**: never pass `--project` unless the user names one. kabu names it from the
+  folder your session started in, the same for every agent, subagent and worktree: a `.kabu` anchor there or above,
+  else the name `kabu project set` gave it, else its git repository. `kabu project` shows it and why; when
+  `.project_source.rule` is `folder`, tell the user its hint (`kabu project set NAME --dir DIR`) instead of picking a
+  name yourself.
+- **Details**: `kabu guide` explains every command; `--dry-run` has the API check a send or ask without sending it.
+- **If kabu fails** (not found, or `missing_api_key`: `kabu login --device` connects this computer), use your
+  built-in ask tool, and say so in your reply.
+"""
 GUIDE = """\nFor coding agents:
 - One argument is the message, two are TITLE MESSAGE; quote multi-word text; - reads stdin.
 - Limits: title 120, message 8192, --field 12 (key 40, value 200), --link 4, --file 10, -c 2 to 12 (label 40).
@@ -1393,7 +1445,7 @@ def cmd_login(cmd: str, a: JSON) -> int:
         if not a["api_key"] and not typed:
             raise CliError("missing_flag", "kabu login needs --device or --api-key.", "Example: kabu login --device")
         cfg["api_key"] = a["api_key"] or value(cmd, KEY, typed)
-    return emit({"ok": True, **known, "config_path": str(save_config(cfg))})
+    return emit({"ok": True, **known, "config_path": str(save_config(cfg)), **agents_hint()})
 
 
 def tool_project() -> Optional[str]:
@@ -2851,9 +2903,9 @@ class SettingsFile:
             out.write(raw)
             os.fchmod(out.fileno(), mode & 0o600)
 
-    def backup(self, raw: bytes) -> str:
+    def backup(self, raw: bytes, kind: str = "presence") -> str:
         """A new 0600 copy of the file's bytes, beside it, under a name no other backup has."""
-        name = f"{self.path.name}.bak-kabu-presence-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}-{uuid.uuid4().hex[:6]}"
+        name = f"{self.path.name}.bak-kabu-{kind}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}-{uuid.uuid4().hex[:6]}"
         self.write(name, raw)
         return str(self.path.with_name(name))
 
@@ -3028,8 +3080,455 @@ def cmd_presence(cmd: str, a: JSON) -> int:
         if not a["harness"]:
             raise CliError("missing_flag", f"kabu presence {action} needs --harness claude, copilot, codex, gemini, cursor or pi.",
                            f"Example: kabu presence {action} --harness claude")
-        return emit(presence_install(a, action == "install"))
+        return emit({**presence_install(a, action == "install"), **(agents_hint() if action == "install" else {})})
     return emit(presence_status())
+
+
+AGENT_BEGIN = "<!-- kabu:begin v{} (managed by kabu agents; edit outside this block) -->"
+AGENT_END = b"<!-- kabu:end -->"
+AGENT_BEGIN_LINE = rb"(?m)^<!-- kabu:begin v(\d+)\.(\d+)\.(\d+)\b[^\r\n]*-->"  # compiled at its first use, as LEGACY_TEXT
+COPILOT_FRONT = b'---\napplyTo: "**"\n---\n\n'  # Copilot CLI puts an instructions file that applies to ** in every session
+LEGACY_TEXT = rb"\bnotify\.py\b|\bkabu(?:\.py)? (?:send|ask)\b"  # Kabu's rules written by hand, or notify.py's
+NOTIFY_PY_TEXTS = {"00b5ec9a4221f6f4caaf0cb3e6c920c2cca00a3eac25e6e706695bc212688819"}  # notify.py's notify.instructions.md
+CURSOR_RULES = "Cursor keeps user rules in its settings, not in a file: paste text into Cursor's Customize, Rules."
+GEMINI_SETTINGS = ("Gemini CLI stops on {} (it is no JSON object, comments aside), so kabu cannot tell which context file it "
+                   "reads: fix that file, then run this again.")
+JSONC = r'"(?:[^"\\]|\\[\s\S])*"?|//[^\n]*|/\*(?:[\s\S]*?\*/|[\s\S]*)'  # a JSON string, or a comment strip-json-comments blanks
+JS_NOT_SPACE = "[^\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"  # JavaScript's \S: what it blanks
+OPENCODE_CLAUDE = ("OpenCode 1 reads ~/.claude/CLAUDE.md only while {} does not exist, so kabu does not create it: create it "
+                   "with text in it yourself (OpenCode 2 reads no CLAUDE.md), then run kabu agents install --harness opencode.")
+LEGACY_HINTS = {"replaceable": "notify.py's instructions, which Kabu's rules replace: kabu agents install --replace-legacy backs "
+                "it up and removes it.", "notify_py": "It names notify.py, the CLI before kabu: once Kabu's rules are "
+                "installed, take its notify.py text out by hand.", "hand_written": "Kabu's rules written by hand: an agent that "
+                "reads this and kabu's block gets both. Keep one: take this text out, or leave its harnesses out with --harness."}
+
+
+class Target(NamedTuple):
+    """Where one harness reads Kabu's rules (CONTRACT.md, Agent instructions): the file kabu writes, and what else it reads."""
+
+    harness: str
+    file: Optional[Path]  # None: no file kabu may write (Cursor)
+    detected: bool  # the harness's folder exists
+    home: Optional[Path] = None  # Copilot CLI's home
+    prefix: Optional[bytes] = None  # a file of kabu's own: what goes before the block when kabu makes it; None: a shared file
+    reads: Tuple[Path, ...] = ()  # every file of the table the harness may read the rules in: uninstall looks in each
+    legacy: Tuple[Path, ...] = ()  # the other instruction files it loads, read for legacy text
+    manual: str = ""  # why kabu does not write it, and where the text goes instead
+
+
+def peek(path: Path) -> Optional[bytes]:
+    """A file's bytes as its harness reads them, links followed (they are only read), or None: missing, unreadable or not
+    a regular file (a FIFO never blocks)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        return os.read(fd, 1 << 22) if stat.S_ISREG(os.fstat(fd).st_mode) else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def first_read(files: Sequence[Path], text: bool = False) -> Optional[Path]:
+    """The first of a harness's files that it reads: one that exists (text: and holds more than white space)."""
+    for path in files:
+        raw = peek(path)
+        if raw is not None and (raw.strip() or not text):
+            return path
+    return None
+
+
+def listed(folder: Path, suffix: str) -> List[Path]:
+    """The files in folder and the folders in it (never through a link) whose names end with suffix, sorted: 50 at most."""
+    return sorted(Path(top, name) for top, _, names in os.walk(folder) for name in names if name.endswith(suffix))[:50]
+
+
+def without_comments(text: str) -> str:
+    """JSON with comments as strip-json-comments 3.1.1 hands it to JSON.parse, which is how Gemini CLI reads its
+    settings.json: each // and /* */ comment outside a string blanked out, JavaScript's white space in it kept."""
+    return re.sub(JSONC, lambda m: re.sub(JS_NOT_SPACE, " ", m[0]) if m[0][0] == "/" else m[0], text)
+
+
+def gemini_names(folder: Path) -> Optional[List[str]]:
+    """Gemini CLI's context file names, as its settings.json's context.fileName gives them (a name or a list), else
+    GEMINI.md; None when Gemini CLI stops on that file, which it reads as JSON with comments: no name is known then."""
+    path = folder / "settings.json"
+    raw = peek(path)
+    if raw is None and not os.path.exists(path):
+        return ["GEMINI.md"]
+    try:
+        settings = json.loads(without_comments((raw or b"").decode("utf-8", "replace")))
+    except ValueError:
+        settings = None
+    if not isinstance(settings, dict):  # unreadable, or no JSON object: Gemini CLI asks for it to be fixed, and stops
+        return None
+    context = settings.get("context")
+    given = context.get("fileName") if isinstance(context, dict) else None
+    names = [given] if isinstance(given, str) else given if isinstance(given, list) else []
+    return [n for n in names if isinstance(n, str) and n.strip(".") and "/" not in n and "\\" not in n] or ["GEMINI.md"]
+
+
+def agent_targets(scan: bool = True) -> List[Target]:
+    """Each harness's target (CONTRACT.md, Agent instructions), Copilot CLI's one per home; scan: list the files to read
+    for legacy text too."""
+    home, env = Path.home(), os.environ.get
+    claude, codex = Path(env("CLAUDE_CONFIG_DIR") or home / ".claude"), Path(env("CODEX_HOME") or home / ".codex")
+    gemini, pi = Path(env("GEMINI_CLI_HOME") or home) / ".gemini", Path(env("PI_CODING_AGENT_DIR") or home / ".pi" / "agent")
+    opencode = Path(env("XDG_CONFIG_HOME") or home / ".config") / "opencode"
+    codex_files, gemini_files = (codex / "AGENTS.override.md", codex / "AGENTS.md"), tuple(gemini / n for n in gemini_names(gemini) or ())
+    pi_files = tuple(pi / n for n in ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"))
+    oc_files = ((Path(env("OPENCODE_CONFIG_DIR") or "") / "AGENTS.md",) if env("OPENCODE_CONFIG_DIR") else ()) + (opencode / "AGENTS.md",)
+    oc_read = first_read(oc_files)
+    hides = not oc_read and os.path.lexists(home / ".claude" / "CLAUDE.md") and not env("OPENCODE_DISABLE_CLAUDE_CODE") \
+        and not env("OPENCODE_DISABLE_CLAUDE_CODE_PROMPT")  # OpenCode 1 reads it only while it has no AGENTS.md
+    return [Target("claude", claude / "rules" / "kabu.md", claude.is_dir(), prefix=b"",
+                   legacy=(claude / "CLAUDE.md", *listed(claude / "rules", ".md"), home / "CLAUDE.md") if scan else ()),
+            *(Target("copilot", h / "instructions" / "kabu.instructions.md", h.is_dir(), home=h, prefix=COPILOT_FRONT,
+                     legacy=(h / "copilot-instructions.md", *listed(h / "instructions", ".instructions.md")) if scan else ())
+              for h in copilot_homes()),
+            Target("codex", first_read(codex_files, text=True) or codex_files[1], codex.is_dir(), reads=codex_files, legacy=codex_files),
+            Target("gemini", (first_read(gemini_files) or gemini_files[0]) if gemini_files else None, gemini.is_dir(), reads=gemini_files,
+                   legacy=gemini_files, manual="" if gemini_files else GEMINI_SETTINGS.format(gemini / "settings.json")),
+            Target("cursor", None, (home / ".cursor").is_dir(), manual=CURSOR_RULES),
+            Target("pi", first_read(pi_files) or pi_files[1], pi.is_dir(), reads=pi_files, legacy=(*pi_files, home / "AGENTS.md")),
+            Target("opencode", oc_read or oc_files[-1], opencode.is_dir(), reads=oc_files, legacy=(*oc_files, home / "AGENTS.md"),
+                   manual=OPENCODE_CLAUDE.format(oc_files[-1]) if hides else "")]
+
+
+def agent_block(nl: bytes = b"\n") -> bytes:
+    """The rules between kabu's markers, in a file's own line breaks."""
+    return nl.join([AGENT_BEGIN.format(VERSION).encode(), *(line.encode() for line in AGENT_RULES.splitlines()), AGENT_END])
+
+
+def block_at(raw: bytes, path: Path) -> Optional[Tuple[int, int, Tuple[int, ...]]]:
+    """Where kabu's block is in a file, and its version; None for none. Two, or a begin line with no end line: invalid_file."""
+    begins = list(re.finditer(AGENT_BEGIN_LINE, raw))
+    end = raw.find(AGENT_END, begins[0].end()) if begins else -1
+    if len(begins) > 1 or begins and end < 0:
+        raise CliError("invalid_file", f"{path} has {'two kabu blocks' if len(begins) > 1 else 'a kabu:begin line with no kabu:end line'}, "
+                       "so kabu left it as it is.", "Leave one kabu:begin line, then one kabu:end line, or leave that harness out "
+                       "with --harness, then run this again.")
+    return (begins[0].start(), end + len(AGENT_END), tuple(int(g) for g in begins[0].groups())) if begins else None
+
+
+def newline(raw: bytes, block: int = -1) -> bytes:
+    """The line break kabu writes in: its block's own (that of the begin line at block), else that of the file's last line,
+    which a new block follows, else LF. Edits elsewhere in the file never change it."""
+    at = raw.find(b"\n", block) if block >= 0 else raw.rfind(b"\n")
+    return b"\r\n" if at > 0 and raw[at - 1:at] == b"\r" else b"\n"
+
+
+def with_block(raw: Optional[bytes], prefix: Optional[bytes], path: Path) -> bytes:
+    """A file with this version's block: in place of the one there, in its line breaks, else at the end, after a blank
+    line, with no line break after it if the file's last line had none, so without_block can take out exactly what it
+    added."""
+    if raw is None:
+        return (prefix or b"") + agent_block() + b"\n"
+    at, ends = block_at(raw, path), raw.endswith(b"\n")
+    nl = newline(raw, at[0] if at else -1)
+    if at:
+        return raw[:at[0]] + agent_block(nl) + raw[at[1]:]
+    return agent_block(nl) + nl if not raw else raw + nl + (b"" if ends else nl) + agent_block(nl) + (nl if ends else b"")
+
+
+def without_block(raw: bytes, path: Path) -> bytes:
+    """A file without kabu's block, nor the line breaks with_block put around it, in the block's own: one on each side, or
+    two before it when nothing came after it. A line added before or after it, in either line break, stays."""
+    at = block_at(raw, path)
+    if not at:
+        return raw
+    nl, head, tail = newline(raw, at[0]), raw[:at[0]], raw[at[1]:]
+    if tail.startswith(nl):  # the blank line before it, after a line that ends in either line break
+        return (head[:-len(nl)] if head.endswith(nl) and head[:-len(nl)].endswith(b"\n") else head) + tail[len(nl):]
+    lone = head.endswith(nl + nl) and (not tail or tail.startswith((b"\n", b"\r\n")))  # the file's last line had no line break
+    return head[:-2 * len(nl)] + tail if lone else head + tail
+
+
+def link_on_way(path: Path) -> bool:
+    """Whether path is a link, or a folder on its way is, other than the system's own (root's): kabu never writes through one."""
+    walked = Path("/")
+    for part in Path(os.path.abspath(path)).parts[1:]:
+        walked /= part
+        try:
+            st = os.lstat(walked)
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode) and st.st_uid != 0:
+            return True
+    return False
+
+
+def agent_state(t: Target, path: Optional[Path] = None) -> JSON:
+    """A target's state (CONTRACT.md, Agent instructions); path: another of the harness's files, for uninstall."""
+    path = path or t.file
+    out: JSON = {"harness": t.harness, "file": str(path) if path else None, **({"home": str(t.home)} if t.home else {})}
+    if not t.detected:
+        return {**out, "state": "not_detected", "version": None}
+    if path is None or t.manual:  # Cursor pastes the rules alone into its settings; a file takes the block
+        return {**out, "state": "manual", "version": None, "text": AGENT_RULES if t.harness == "cursor" else agent_block().decode() + "\n",
+                "hint": t.manual}
+    raw, linked = peek(path), link_on_way(path)
+    at = block_at(raw, path) if raw is not None else None
+    current = raw is not None and at is not None and (at[2] > tuple(int(p) for p in VERSION.split("."))
+                                                      or raw[at[0]:at[1]] == agent_block(newline(raw, at[0])))
+    out.update(state="installed" if current else "linked" if linked else "outdated" if at else "absent",
+               version=".".join(str(n) for n in at[2]) if at else None, **({"real_path": os.path.realpath(path)} if linked else {}))
+    if out["state"] == "linked":
+        out.update(text=agent_block().decode() + "\n", hint=f"kabu never writes through a link: add text to {out['real_path']}, or to "
+                   "the file it is made from, then run kabu agents status.")
+    return out
+
+
+def agents_hint(states: Optional[List[JSON]] = None) -> JSON:
+    """{"hint"} when a detected harness's target lacks Kabu's rules (absent, outdated or linked), else {}: it only reads
+    those files, and never gets in the way of the command that asks."""
+    try:
+        found = [agent_state(t) for t in agent_targets(scan=False)] if states is None else states
+    except (CliError, OSError):
+        return {}
+    names = list(dict.fromkeys(AGENT_NAMES[s["harness"]] for s in found if s["state"] in ("absent", "outdated", "linked")))
+    named = ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else "".join(names)
+    return {"hint": f"Run kabu agents install so {named} know Kabu's rules: to ask and update you through Kabu, with one project "
+                    "name per piece of work (kabu agents status shows each file)."} if names else {}
+
+
+def unified(path: Path, old: Optional[bytes], new: Optional[bytes]) -> str:
+    """A change as a unified diff, which says when a last line has no line break, as diff does."""
+    before, after = (re.findall(r"[^\n]*\n|[^\n]+$", (raw or b"").decode("utf-8", "replace")) for raw in (old, new))
+    lines = difflib.unified_diff(before, after, str(path) if old is not None else "/dev/null", str(path) if new is not None else "/dev/null")
+    return "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines)
+
+
+def same_file(one: Path, other: Path) -> bool:
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
+
+
+def cannot_write(folder: Path) -> str:
+    """Why kabu could not write a file in folder (its new bytes, its backup), else "": the folder, or when kabu must make it
+    the nearest one above it that is there, has to be a folder of this user's that this user may write in."""
+    there = folder
+    while not os.path.lexists(there) and there != there.parent:
+        there = there.parent
+    try:
+        st = os.stat(there)  # the way to it has no link but the system's own: settings_dir checked it
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and os.access(there, os.W_OK | os.X_OK):
+            return ""
+    except OSError:
+        pass
+    return f"{there} is not a folder of this user's that kabu can write in" + (f" (to make {folder})" if there != folder else "") + "."
+
+
+def cannot_keep() -> str:
+    """Why kabu could not keep agents.json in its folder (KABU_HOME, else ~/.kabu), else "": a folder of this user's, never a
+    link, that this user may write in, or, when it is not there yet, one kabu can make in the folder above it. It only
+    reads (own_dir would tighten the folder's mode), so a dry run checks it too."""
+    home = kabu_home()
+    if os.path.islink(home):
+        return f"{home} is a link, and kabu keeps agents.json only in a folder of this user's."
+    if os.path.lexists(home):
+        return cannot_write(home)
+    made = os.path.isdir(home.parent) and os.access(home.parent, os.W_OK | os.X_OK)
+    return "" if made else f"{home} is not there, and kabu cannot make it in {home.parent}."
+
+
+def agent_change(t: Target, st: JSON, install: bool, write: bool, manifest: JSON) -> List[JSON]:
+    """Install or uninstall one target, or (write False) only work out its change, as a diff. Uninstall takes the block out
+    of each of the harness's files that has one, each a target of its own."""
+    if t.file is None or st["state"] in ("not_detected", "manual") or "real_path" in st or install and st["state"] == "installed":
+        return [{**st, "changed": False, "backup": None, **({} if write else {"diff": ""})}]
+    paths = [t.file]
+    for other in () if install else t.reads:
+        if re.search(AGENT_BEGIN_LINE, peek(other) or b"") and not link_on_way(other) and not any(same_file(other, p) for p in paths):
+            paths.append(other)
+    return [{**(st if path == t.file else agent_state(t, path)), **change_file(t, path, install, write, manifest)} for path in paths]
+
+
+def change_file(t: Target, path: Path, install: bool, write: bool, manifest: JSON) -> JSON:
+    """agent_change for one file, read and written only through its verified folder (SettingsFile), after a backup; manifest
+    keeps whether kabu made it, its backup and what kabu left in it."""
+    key = os.path.abspath(path)
+    try:
+        target = SettingsFile.open(path, create=write and install)
+        raw, mode = target.read() if target else (None, 0o600)
+    except CliError as e:  # not this user's, or not a regular file (a link is linked, and never opened)
+        raise CliError("unsafe_file", e.message, f"Fix it, or leave {t.harness} out with --harness, then run this again.") from None
+    try:
+        entry: JSON = manifest.get(key) or {}
+        kept = raw is not None and digest(raw) == entry.get("after")  # as kabu left it
+        new: Optional[bytes] = raw
+        if install:
+            new = with_block(raw, t.prefix, path)
+        elif raw is not None and target is not None and block_at(raw, path):
+            first = peek(Path(entry["backup"])) if kept and entry.get("before") and entry.get("backup") else None  # its digest is checked
+            new = first if first is not None and digest(first) == entry.get("before") else without_block(raw, path)
+            if new is not None and (t.prefix is not None or entry.get("created")) and new.strip() in (b"", COPILOT_FRONT.strip()):
+                new = None  # nothing but kabu's is left in a file kabu made
+        out: JSON = {"state": "installed" if install else "absent", "version": VERSION if install else None, "changed": new != raw,
+                     "backup": None}
+        why = cannot_write(path.parent) if not write and new != raw else ""  # checked with every other target, before any changes
+        if why:
+            raise CliError("unsafe_file", why, f"Fix it, or leave {t.harness} out with --harness, then run this again.")
+        if not write or target is None or new == raw:
+            return {**out, **({} if write else {"diff": unified(path, raw, new) if new != raw else ""})}
+        if raw is not None and not kept:
+            out["backup"] = target.backup(raw, "agents")
+        if new is None:
+            target.remove()
+        else:
+            target.replace(new, mode)
+        if install:  # once the file has its new bytes: a run that stops part way records only what it changed
+            fresh = {"created": raw is None, "backup": out["backup"], "before": digest(raw) if raw is not None and not block_at(raw, path) else None}
+            manifest[key] = {**(entry if kept else fresh), "after": digest(new or b"")}
+        else:
+            manifest.pop(key, None)
+        return out
+    finally:
+        if target is not None:
+            target.close()
+
+
+def legacy_digest(raw: bytes) -> str:
+    """A text's digest, its line endings, trailing spaces and blank lines at either end aside."""
+    lines = raw.decode("utf-8", "replace").replace("\r\n", "\n").split("\n")
+    return digest("\n".join(line.rstrip() for line in lines).strip().encode())
+
+
+def agent_legacy(targets: Sequence[Target]) -> List[Tuple[JSON, List[Target]]]:
+    """The other instruction files the detected harnesses load that carry Kabu's rules by hand, each with its readers."""
+    found: Dict[str, Tuple[JSON, List[Target]]] = {}
+    for t in targets:
+        for path in t.legacy if t.detected else ():
+            raw = peek(path)
+            try:
+                at = block_at(raw, path) if raw is not None else None
+            except CliError:
+                at = None
+            outside = raw[:at[0]] + raw[at[1]:] if raw is not None and at else raw
+            if outside is None or not re.search(LEGACY_TEXT, outside):
+                continue
+            key, notify = os.path.abspath(path), b"notify.py" in outside and not re.search(rb"\bkabu (?:send|ask)\b", outside)
+            if key not in found:
+                replaceable = notify and legacy_digest(outside) in NOTIFY_PY_TEXTS and not link_on_way(path)
+                found[key] = ({"file": key, "kind": "notify_py" if notify else "hand_written", "harnesses": [], "replaceable": replaceable,
+                               "hint": LEGACY_HINTS["replaceable" if replaceable else "notify_py" if notify else "hand_written"]}, [])
+            entry, readers = found[key]
+            entry["harnesses"] += [] if t.harness in entry["harnesses"] else [t.harness]
+            readers.append(t)
+    return list(found.values())
+
+
+def retire(entry: JSON, write: bool) -> None:
+    """--replace-legacy for one replaceable file: backed up, then removed, through its verified folder."""
+    path, target = Path(entry["file"]), None
+    try:
+        target = SettingsFile.open(path)
+        raw = target.read()[0] if target else None
+        if target is None or raw is None:
+            return
+        entry["replaced"] = True
+        if not write:
+            why = cannot_write(path.parent)  # checked before any target changes
+            if why:
+                raise CliError("unsafe_file", why, "")
+            entry["diff"] = unified(path, raw, None)
+            return
+        entry["backup"] = target.backup(raw, "agents")
+        target.remove()
+    except CliError as e:
+        raise CliError("unsafe_file", e.message, "Fix it, or run this again without --replace-legacy.") from None
+    finally:
+        if target is not None:
+            target.close()
+
+
+def copilot_plugin(home: Path, write: bool) -> JSON:
+    """--plugin for one Copilot home: copilot plugin install kabu@ai-agentics there, after marketplace add when its settings do
+    not know ai-agentics, with no input and 120 s a step. It never fails the install."""
+    try:
+        settings = json.loads(peek(home / "settings.json") or b"{}")
+    except ValueError:
+        settings = {}
+    settings = settings if isinstance(settings, dict) else {}
+    hooks, markets = settings.get("hooks"), settings.get("extraKnownMarketplaces")
+    steps = ([] if isinstance(markets, dict) and "ai-agentics" in markets else [["plugin", "marketplace", "add", "ai-agentics/plugins"]])
+    steps.append(["plugin", "install", "kabu@ai-agentics"])
+    exe = shutil.which("copilot")
+    out: JSON = {"state": "present"} if (home / "installed-plugins" / "ai-agentics" / "kabu").is_dir() else \
+        {"state": "skipped", "error": "copilot is not on PATH"} if exe is None else \
+        {"state": "would_install", "commands": [f"COPILOT_HOME={shlex.quote(str(home))} copilot {' '.join(s)}" for s in steps]}
+    if write and exe is not None and out["state"] == "would_install":
+        out = {"state": "installed"}
+        for step in steps:
+            try:
+                done = subprocess.run([exe, *step], env={**os.environ, "COPILOT_HOME": str(home)}, stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True, timeout=120)
+                said = [line.strip() for line in (done.stderr.strip() or done.stdout).splitlines() if line.strip()]
+                error = (said[-1] if said else f"exit {done.returncode}")[:300] if done.returncode else ""
+            except (OSError, subprocess.SubprocessError) as exc:
+                error = str(exc)[:300]
+            if error and step[1] == "install":
+                out = {"state": "failed", "error": error}
+    if out["state"] in ("present", "installed", "would_install") and isinstance(hooks, dict) \
+            and any(ours(e) for v in hooks.values() if isinstance(v, list) for e in v):
+        out["hint"] = (f"The plugin has its own presence hooks, and {home / 'settings.json'} has kabu presence install's too: keep "
+                       f"one, as with kabu presence uninstall --harness copilot --settings {home / 'settings.json'}")
+    return out
+
+
+def cmd_agents(cmd: str, a: JSON) -> int:
+    """kabu agents status, install and uninstall (CONTRACT.md, Agent instructions)."""
+    action = cmd.split()[1]
+    check(cmd, COMMANDS[cmd].opts, a)
+    named = set(a["harness"])
+    targets = [t for t in agent_targets() if not named or t.harness in named]
+    missing = sorted(named - {t.harness for t in targets if t.detected})
+    if action == "install" and missing:
+        raise CliError("missing_folder", f"{', '.join(AGENT_NAMES[m] for m in missing)}: no folder of its is here, so kabu has "
+                       "nothing to add its rules to.", "Start that harness once, or leave it out of --harness, then run this again.")
+    states = [agent_state(t) for t in targets]
+    if action == "status":
+        return emit({"ok": True, "version": VERSION, "targets": states, "legacy": [e for e, _ in agent_legacy(targets)], **agents_hint(states)})
+    install, write = action == "install", not a["dry_run"]
+    manifest = read_json(kabu_home() / "agents.json")
+    done: List[List[JSON]] = []
+    legacy: List[Tuple[JSON, List[Target]]] = []
+    planned = False
+    for writing in (False, True) if write else (False,):  # every target read and checked before any changes
+        if writing and not planned:
+            break  # nothing to change: no backup, no manifest, no folder made
+        if writing and not (os.path.isdir(kabu_home()) or own_dir(kabu_home(), create=True)):
+            raise CliError("unsafe_folder", f"{kabu_home()} is not a folder of this user's, or is a link.", "Remove it, then run this again.")
+        recorded = dict(manifest)
+        try:
+            done = [agent_change(t, st, install, writing, manifest) for t, st in zip(targets, states)]
+            after, legacy = {t: d[0]["state"] for t, d in zip(targets, done)}, agent_legacy(targets)
+            for entry, readers in legacy if install and a.get("replace_legacy") else ():
+                if entry["replaceable"] and all(after[t] == "installed" for t in readers):
+                    retire(entry, writing)
+        except OSError as exc:  # one no check foresaw, such as a full disk
+            raise CliError("local_error", f"{type(exc).__name__}: {exc}.", "Fix the file or folder it names, or leave its harness out "
+                           "with --harness, then run this again: kabu agents status shows each file.") from None
+        finally:  # a run that stops part way still records what it changed, so that uninstall can undo it
+            if writing and manifest != recorded:
+                write_private(kabu_home() / "agents.json", manifest)
+        planned = any(r["changed"] for d in done for r in d) or any(e.get("replaced") for e, _ in legacy)
+        why = cannot_keep() if planned and not writing else ""  # agents.json's folder, checked with the targets
+        if why:
+            raise CliError("unsafe_folder", why, "Make it a folder of this user's that this user may write in, not a link, then run "
+                           "this again.")
+    for t, d in zip(targets, done):
+        if install and a.get("plugin") and t.home is not None and t.detected:
+            d[0]["plugin"] = copilot_plugin(t.home, write)
+    results = [{k: v for k, v in r.items() if k != "diff" or not write} for d in done for r in d]
+    return emit({"ok": True, "version": VERSION, "dry_run": not write, "changed": any(r["changed"] for r in results)
+                 or any(e.get("replaced") for e, _ in legacy), "targets": results, "legacy": [e for e, _ in legacy],
+                 **({} if not install or shutil.which("kabu") else {"hint": "No kabu on PATH, so these agents cannot run it: mkdir -p "
+                    "~/.local/bin && curl -fsSL https://usekabu.com/kabu -o ~/.local/bin/kabu && chmod +x ~/.local/bin/kabu"})})
 
 
 @dataclass(frozen=True)
@@ -3115,6 +3614,22 @@ COMMANDS = {
   kabu presence install --harness pi          an extension pi loads at its next start""", PRESENCE_SETTINGS),
     "presence uninstall": Command(cmd_presence, "Take the presence hook out of a harness's settings, after a backup.", """\
   kabu presence uninstall --harness claude""", PRESENCE_SETTINGS),
+    "agents status": Command(cmd_agents, "Print, for each coding agent's global instructions, whether they have Kabu's rules: "
+                             "installed, outdated, absent, linked, not_detected or manual; and legacy, files that carry them by "
+                             "hand. Writes nothing.", """\
+  kabu agents status | jq -r '.targets[] | "\\(.state)  \\(.harness)  \\(.file)"'""", AGENTS[:2]),
+    "agents install": Command(cmd_agents, "Write Kabu's rules (kabu guide prints them first) into every detected coding agent's "
+                              "global instructions, after a backup: a file of kabu's own, or a marked block in the shared one, never "
+                              "through a link. Running it again changes nothing; a newer kabu updates them.", """\
+  kabu agents install --dry-run           each change as a unified diff; nothing is written
+  kabu agents install
+  kabu agents install --harness claude --harness codex
+  kabu agents install --replace-legacy    also retire a notify.py instructions file whose text kabu knows
+  kabu agents install --plugin            also put the Kabu plugin in each Copilot home without it""", AGENTS_INSTALL),
+    "agents uninstall": Command(cmd_agents, "Take Kabu's rules out of every detected coding agent's instructions: only kabu's "
+                                "block, or its own file; a file as kabu left it gets its exact bytes back.", """\
+  kabu agents uninstall --dry-run
+  kabu agents uninstall --harness pi""", AGENTS),
 }
 
 
@@ -3123,14 +3638,14 @@ def run(args: List[str]) -> int:
     if not args:
         raise CliError("missing_command", "kabu needs a command or a message.", 'Run: kabu --help, or: kabu send "Build passed"')
     head = args[0]
-    if head in ("-h", "--help") or args[:2] in (["session", "--help"], ["presence", "--help"]):
+    if head in ("-h", "--help") or args[:2] in (["session", "--help"], ["presence", "--help"], ["agents", "--help"]):
         print(__doc__)
         return EXIT_OK
     if head == "--version":
         print(f"kabu {VERSION}")
         return EXIT_OK
-    if head == "guide" or args[:2] == ["help", "agents"]:  # the rules, then every command's examples
-        print(__doc__ + GUIDE + "".join(f"\n\nkabu {name}: {c.about}\n{c.examples}" for name, c in COMMANDS.items()))
+    if head == "guide" or args == ["help", "agents"]:  # what kabu is, its rules for agents, then every command's examples
+        print(__doc__ + "\n" + AGENT_RULES + GUIDE + "".join(f"\n\nkabu {name}: {c.about}\n{c.examples}" for name, c in COMMANDS.items()))
         return EXIT_OK
     if head == "help":
         if args[1:] and args[1] not in NAMES:
@@ -3140,10 +3655,10 @@ def run(args: List[str]) -> int:
         close = difflib.get_close_matches(args[1], ("set", "unset", "list"), n=1)
         raise CliError("unknown_command", f"kabu project takes set, unset or list, not {args[1]!r}." + (f" Did you mean {close[0]!r}?" if close
                        else " kabu.py's project settings are not in kabu."), 'Example: kabu project set "CTF Nov 2026"')
-    name = " ".join(args[:2]) if head in ("session", "presence") or head == "project" and " ".join(args[:2]) in COMMANDS else head
+    name = " ".join(args[:2]) if head in ("session", "presence", "agents") or head == "project" and " ".join(args[:2]) in COMMANDS else head
     if name in COMMANDS:
         return COMMANDS[name].handler(name, parse(name, args[len(name.split()):]))
-    if head in ("session", "presence"):
+    if head in ("session", "presence", "agents"):
         subs = [n.split()[1] for n in COMMANDS if n.startswith(head + " ")]
         close = difflib.get_close_matches(" ".join(args[1:2]), subs, n=1)
         raise CliError("unknown_command", f"kabu {head} takes {', '.join(subs[:-1])} or {subs[-1]}, not {' '.join(args[1:2])!r}."
