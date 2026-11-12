@@ -119,6 +119,9 @@ hashed ids, the client's name and the session's project leave the machine. Your 
   `kabu project set NAME --dir DIR`, names that workspace once for every agent; never pick a name yourself.
 - `--dry-run` on `send` or `ask`: the API checks it and shows the push; nothing is sent.
 - `kabu COMMAND --help`: every option and its limit.
+- Only when the user asks for every coding agent on the computer to use Kabu: `kabu agents install --dry-run` shows
+  what it would write, then `kabu agents install` puts Kabu's rules in each agent's global instructions (`kabu agents
+  status` shows which have them). Never run it otherwise: it writes outside this project.
 
 ## MCP tools
 

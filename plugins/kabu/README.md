@@ -53,6 +53,21 @@ shows you the code. Claude Code puts the plugin's `bin/` on the PATH of the agen
 Or install it on your PATH: `mkdir -p ~/.local/bin && curl -fsSL https://usekabu.com/kabu -o ~/.local/bin/kabu && chmod +x ~/.local/bin/kabu`.
 Check the login with `kabu whoami`.
 
+## Every agent on this computer
+
+The plugin's skill reaches the client it is installed in. To have every coding agent on this computer ask and update
+you through Kabu (Claude Code and every Copilot home, Codex, Gemini CLI, pi and OpenCode; Cursor gets the text to paste
+into its settings), put Kabu's rules in their global instructions:
+
+```bash
+kabu agents install --dry-run   # each change as a diff; nothing is written
+kabu agents install             # after a backup; running it again changes nothing
+kabu agents status              # which agents have the rules
+```
+
+It writes a file of its own, or a marked block in the file the agent reads, never through a link, and `kabu agents
+uninstall` takes it out. `kabu agents install --plugin` also installs this plugin in each Copilot home without it.
+
 ## Use it
 
 Ask in plain words: "tell me on my phone when the tests finish", "ask me before you deploy". The agent loads the
@@ -165,6 +180,7 @@ nothing else Herdr prints leaves your computer. It is off by default, and `kabu 
 | Messages land in another project | The project is what the folder the agent session started in names, whatever folder a command runs in (Projects, above); `kabu project` shows it and, in `project_source`, why. Name a workspace once with `kabu project set NAME --dir DIR`; set `KABU_PROJECT` to choose another for one agent |
 | A Copilot session never reads working | `kabu presence status` lists it under `copilot`: run `kabu presence install --harness copilot` if it says `no_hook`, then restart that session |
 | An ask returns exit 20 | It expired unanswered; raise `--expires-in` (default 300 seconds) |
+| An agent asks in the terminal, or never sends updates | `kabu agents status` shows which agents lack Kabu's rules; `kabu agents install` adds them |
 | No hook pushes | Set `KABU_HOOKS=1` before starting the agent, then restart it |
 | The app shows no presence | `kabu presence status`: `enabled`, a `lanes` entry for the session and `last_beat` without an `error`; log in if it is `missing_api_key` |
 
